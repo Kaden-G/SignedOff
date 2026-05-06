@@ -22,9 +22,11 @@
 11. [API Contract (Backend ↔ Frontend)](#api-contract-backend--frontend)
 12. [Division of Labor](#division-of-labor)
 13. [Scope: In vs. Out for v1](#scope-in-vs-out-for-v1)
-14. [Submission Requirements](#submission-requirements)
-15. [Timeline](#timeline)
-16. [Open Questions / TBD](#open-questions--tbd)
+14. [Performance & Scale Targets](#performance--scale-targets)
+15. [Production Considerations (Roadmap)](#production-considerations-roadmap-not-v1-scope)
+16. [Submission Requirements](#submission-requirements)
+17. [Timeline](#timeline)
+18. [Open Questions / TBD](#open-questions--tbd)
 
 ---
 
@@ -466,6 +468,10 @@ Established Day 1, no overlap:
 ✅ Risk matrix dashboard (Ashu)
 ✅ Demo video + pitch deck + submission writeup
 
+### STRETCH (if Day 7 polish time available)
+
+🎯 Demo-curated cache (`demo_cache.json`) — pre-fetched data for the specific packages in our demo `requirements.txt`, enabling the cold-vs-warm scan demo moment without building production-grade pre-warming. See [Production Considerations](#production-considerations-roadmap-not-v1-scope) for details.
+
 ### OUT (v2+)
 
 ❌ Cache invalidation scheduler (just stamp `cached_at` for now)
@@ -478,6 +484,101 @@ Established Day 1, no overlap:
 ❌ Multi-tenant / org isolation
 ❌ SSO / RBAC for the dashboard
 ❌ Webhook integrations (Slack, Jira, etc.)
+
+---
+
+## Performance & Scale Targets
+
+### Realistic Package Counts
+
+| Project type | Direct deps | Total resolved (incl. transitive) |
+|---|---|---|
+| Tiny CLI tool | 3-5 | 20-50 |
+| Small Flask/FastAPI app | 10-15 | 60-120 |
+| Standard Django app | 20-30 | 100-200 |
+| Data science / ML project | 15-25 | 150-300 |
+| Modern AI/LLM app (LangChain) | 25-40 | 300-500+ |
+| Large enterprise monorepo | 50-100+ | 500-1,500+ |
+
+**Target for hackathon demo:** 80-150 packages with deliberately seeded license issues and known CVEs. Big enough to be impressive, small enough to finish in demo time.
+
+### Latency Targets
+
+**Cold scan (~300 packages, no cache):**
+
+| Step | Target |
+|---|---|
+| SBOMNode (subprocess + normalize) | 3-5 sec |
+| License checks (300 pkgs, semaphore=10) | 6-8 sec |
+| CVE checks via OSV `/v1/querybatch` | 2-4 sec |
+| RiskNode (LLM reasoning) | 5-15 sec |
+| **Total cold scan** | **~20-35 sec** |
+
+**Warm scan (same project, 80% L1 cache hit rate):**
+
+| Step | Target |
+|---|---|
+| SBOMNode | 3-5 sec |
+| License checks (60 uncached, semaphore=10) | 1-2 sec |
+| CVE checks (60 uncached, batched) | ~1 sec |
+| RiskNode | 5-15 sec |
+| **Total warm scan** | **~10-25 sec** |
+
+### Critical Optimizations
+
+1. **OSV `/v1/querybatch` endpoint** — accepts up to 1,000 packages in one request. Without this, 300 packages = 300 serial API calls. Non-negotiable use.
+
+2. **Semaphore-bounded concurrency** — cap concurrent API calls to 10-20 to avoid rate limits. Use `asyncio.Semaphore(10)` inside LicenseNode and CVENode fan-outs.
+
+3. **L1 cache aggressively** — even 50% hit rate cuts API calls in half. Surface cache stats in UI ("84 of 312 packages served from cache") to make optimization visible.
+
+### UI Implications
+
+Cold scans take 20-35 seconds even with full optimization. Frontend needs:
+- Package count progress: "127 of 312 packages analyzed"
+- Phase indication: "Resolving dependencies → Checking licenses → Scanning for CVEs"
+- Live cache hit counter: "84 packages served from cache"
+- No bare spinners — always show what's happening
+
+---
+
+## Production Considerations (Roadmap, Not v1 Scope)
+
+These are documented for narrative purposes — to signal in the demo that we understand what production looks like — without committing to building them in the hackathon window.
+
+### Pre-warmed Package Cache (v3 production feature)
+
+In production, pre-warm the L1 cache for the top 5,000 PyPI packages by download volume. Refreshed nightly via background job. Covers ~80% of dependencies in a typical project, so first-time scans hit cache hard for most users.
+
+**Tiering:**
+- **Tier 1:** Top 1,000 PyPI packages — pre-cached, refreshed nightly, never evicted
+- **Tier 2:** Per-customer warmed cache — populated after first scan, refreshed weekly
+- **Tier 3:** Just-in-time — fetched on demand, normal TTL
+
+**Production positioning:** "Existing tools scan in real-time, hitting external APIs every time. Our pre-warmed cache means 90% of your scan completes against local data. Faster, more reliable when external APIs are down, and reduces dependency on third-party rate limits."
+
+### Hackathon Stretch: Demo-Curated Cache (Day 7 polish, if time)
+
+A lightweight version that gets the demo benefit without the production complexity:
+
+- Ship a `demo_cache.json` containing pre-fetched data for the specific 80-150 packages in our demo `requirements.txt`
+- Load at startup, populate L1 cache from it
+- Enables the cold-vs-warm demo moment without building real pre-warming infrastructure
+
+**Cost:** 2-3 hours on Day 6-7. Cut if behind schedule.
+
+**Demo framing (honest):** *"For this demo we've pre-cached the packages in this sample project. In production this same mechanism would pre-cache the top 5,000 packages on PyPI, refreshed nightly."*
+
+### Other Production Items (Roadmap Only)
+
+- **Persistent state store** — replace in-memory state with PostgreSQL for production
+- **Multi-tenancy** — org isolation, per-org policy stores, per-org audit trails
+- **SSO / RBAC** — enterprise auth integration (SAML, OIDC)
+- **Observability** — OpenTelemetry traces, Prometheus metrics, structured logging
+- **Webhook integrations** — Slack notifications, Jira ticket creation, GitHub PR comments
+- **Auto-PR remediation** — actually open PRs to bump versions for AUTO_REMEDIATE findings
+- **Sandbox install mode** — for packages with C extensions / dynamic deps
+- **Multi-ecosystem support** — npm, Maven, Go modules, NuGet
 
 ---
 
