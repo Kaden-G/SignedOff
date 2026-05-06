@@ -12,21 +12,22 @@
 1. [Product Vision](#product-vision)
 2. [The Problem](#the-problem)
 3. [Differentiation & Moat](#differentiation--moat)
-4. [Pipeline Architecture](#pipeline-architecture)
-5. [The Four Wickets](#the-four-wickets)
-6. [Technology Stack](#technology-stack)
-7. [State Schema (AgentState)](#state-schema-agentstate)
-8. [Citation Integrity Guardrails](#citation-integrity-guardrails)
-9. [Memory Architecture](#memory-architecture)
-10. [LangGraph Node Architecture](#langgraph-node-architecture)
-11. [API Contract (Backend ↔ Frontend)](#api-contract-backend--frontend)
-12. [Division of Labor](#division-of-labor)
-13. [Scope: In vs. Out for v1](#scope-in-vs-out-for-v1)
-14. [Performance & Scale Targets](#performance--scale-targets)
-15. [Production Considerations (Roadmap)](#production-considerations-roadmap-not-v1-scope)
-16. [Submission Requirements](#submission-requirements)
-17. [Timeline](#timeline)
-18. [Open Questions / TBD](#open-questions--tbd)
+4. [Market Context](#market-context)
+5. [Pipeline Architecture](#pipeline-architecture)
+6. [The Four Wickets](#the-four-wickets)
+7. [Technology Stack](#technology-stack)
+8. [State Schema (AgentState)](#state-schema-agentstate)
+9. [Citation Integrity Guardrails](#citation-integrity-guardrails)
+10. [Memory Architecture](#memory-architecture)
+11. [LangGraph Node Architecture](#langgraph-node-architecture)
+12. [API Contract (Backend ↔ Frontend)](#api-contract-backend--frontend)
+13. [Division of Labor](#division-of-labor)
+14. [Scope: In vs. Out for v1](#scope-in-vs-out-for-v1)
+15. [Performance & Scale Targets](#performance--scale-targets)
+16. [Production Considerations (Roadmap)](#production-considerations-roadmap-not-v1-scope)
+17. [Submission Requirements](#submission-requirements)
+18. [Timeline](#timeline)
+19. [Open Questions / TBD](#open-questions--tbd)
 
 ---
 
@@ -87,6 +88,68 @@ Our defense:
 - **Vulnerability data:** OSV.dev is open-source and free. NVD is government-funded. We don't depend on Snyk/Mend/FOSSA APIs.
 - **License data:** SPDX is an open standard with a downloadable static dataset.
 - **Our actual moat:** the orchestration layer (LangGraph agents + decision gates + audit trail). That's our code, not anyone else's.
+
+---
+
+## Market Context
+
+We are not entering an empty market. Several established tools touch parts of this problem space. Honest assessment of the landscape and where we genuinely differentiate:
+
+### Competitive Landscape
+
+| Tool | What they do well | What they don't do |
+|---|---|---|
+| **Snyk** ($-$$) | Dominant CVE scanner, broad ecosystem, opens PRs | License detection bolted on; no use-case reasoning; no policy-as-code; no tamper-evident audit |
+| **GitHub Dependabot** (free) | CVE alerts + auto-PRs in GitHub-native workflow | No policy layer, no audit trail, no license focus, no contextualization |
+| **FOSSA** ($$) | Strong license detection and reporting | Weak on use-case reasoning; security is secondary; passive dashboard |
+| **Black Duck** ($$$) | Enterprise heavyweight, both license + security | Slow, expensive, dashboard-centric, generic risk scoring |
+| **Mend (WhiteSource)** ($$) | Solid both dimensions, established enterprise presence | Generic policies, no agentic remediation, closed data sources |
+| **JFrog Xray** ($$$) | License + security, strong if already on Artifactory | Tightly coupled to JFrog ecosystem |
+| **Socket.dev** ($-$$) | Novel angle: supply chain attack detection (typosquatting, malicious packages) | Adjacent problem, not direct competitor |
+| **Trivy / Grype** (free) | Solid CLI-based CVE scanning | No enterprise workflow, no policy, no audit trail |
+| **FOSSology** (free) | Open source license scanning | License-only, no security, dated UX |
+
+### Why a Customer Would Choose Us Over These
+
+We are NOT trying to beat Snyk for the average startup. They have a 10x larger team and 100x more vulnerability research investment. We compete in a specific lane:
+
+**Compliance-regulated organizations** that need:
+
+1. **Audit-defensible decision trails.** Hash-chained, tamper-evident, citation-backed. SOC 2, FedRAMP, CMMC auditors ask "show me your evidence" — we have it. Snyk shows you a dashboard.
+
+2. **Policy-as-code uniformity.** Distributed teams making consistent decisions based on a declarative `POLICY.yml`, not individual reviewer judgment. Required for orgs with ISSO/compliance officer roles.
+
+3. **Use-case-aware contextualization.** A GPL-3.0 dep is fine in internal tooling, lethal in distributed binary. Same CVE has different actual risk in SaaS vs. air-gapped deployments. Generic CVSS scores don't capture this; existing tools punt this judgment to the human.
+
+4. **Open, no vendor lock-in.** Built on OSV (open), SPDX (open), curated mappings (transparent). No proprietary vulnerability databases, no closed scoring algorithms. Auditors can verify our reasoning end-to-end.
+
+5. **Citation integrity guarantees.** Every claim is sourced. Every source is timestamped and validated. NONE_FOUND is an explicit, visible state. No hallucinated CVEs, no made-up package alternatives. Critical for organizations where false data is itself a compliance failure.
+
+6. **Two-dimensional risk presentation.** License risk and security risk shown side-by-side, never fused. Different decision-makers (legal vs. security) can engage with their own dimension without sifting through merged scores.
+
+### Honest Caveats
+
+- **Snyk could add hash-chained audit trails.** They won't, because their existing customers don't ask for it and it's not their core market. Classic incumbent disadvantage we're exploiting.
+- **For startups doing rapid CI/CD with low compliance burden, Snyk or Dependabot is probably a better fit.** That's fine. We're not trying to win that segment.
+- **For Fortune 500 orgs already deeply invested in Black Duck or JFrog, switching costs are real.** We're better positioned for greenfield deployments and orgs where current tools are generating unacceptable alert fatigue or audit gaps.
+
+### Target Customer Profile
+
+**Primary ICP (Ideal Customer Profile):**
+- Defense contractors, federal agencies (TS/SCI environments)
+- Fintech with SOC 2 / PCI DSS requirements
+- Healthcare with HIPAA / HITRUST requirements
+- Public companies with SOX compliance
+- Any org where "show me your evidence" is a regular question from auditors
+
+**Secondary ICP:**
+- Mid-market regulated SaaS companies frustrated with Snyk's signal-to-noise ratio
+- Open source-aligned orgs uncomfortable with closed vendor data
+
+**Not a fit:**
+- Early-stage startups with no compliance requirements
+- Orgs deeply integrated into a single vendor's ecosystem (JFrog Artifactory + Xray, etc.)
+- Orgs where dependency scanning is a checkbox, not an active workflow
 
 ---
 
@@ -349,11 +412,48 @@ Three layers, each with a distinct purpose:
 **Key:** `package + version + finding_type + use_case + policy_hash`
 **Stores:** prior human decisions, accepted risks, rationale
 **TTL:** None (this is an audit artifact)
-**Purpose:** "We already reviewed this." When a finding hits L2, the HITL gate surfaces:
+**Purpose:** Honor prior decisions without forcing re-litigation, while preserving accountability.
 
-> *"This finding was reviewed on [date] and accepted with rationale: [X]. Policy unchanged. Recommend confirm or re-review."*
+**Critical design decision: L2 hits NEVER auto-resolve silently by default.** Silent auto-approval has a subtle but real failure mode — context drift. Just because someone accepted a risk on March 15 doesn't mean the circumstances still hold:
 
-This is the actual differentiator vs. existing tools. Compliance teams hate re-litigating decisions.
+- Use case may have changed (was internal, now SaaS)
+- The CVE may have been re-scored (was MEDIUM, now CRITICAL)
+- A patch may now exist that didn't before
+- Compensating controls may have been removed
+- The original reviewer may no longer work there
+- New related CVEs may stack with the original
+
+To balance "don't make me re-litigate" with accountability, L2 behavior is configurable per severity in `POLICY.yml`:
+
+```yaml
+prior_decisions:
+  critical:
+    mode: "always_resurface"        # never auto-approve
+  high:
+    mode: "show_for_confirmation"   # one-click confirm
+  medium:
+    mode: "show_for_confirmation"
+  low:
+    mode: "auto_approve_with_log"   # silent, but audit-logged
+```
+
+**Three modes:**
+
+1. **`always_resurface`** — prior decision is shown but treated as "must re-review." Reviewer must engage with the finding fresh. Default for CRITICAL severity.
+
+2. **`show_for_confirmation`** — prior decision shown prominently with a "Confirm previous decision" one-click button. Reviewer can confirm in 2 seconds OR drill in if something feels off. Default for HIGH and MEDIUM.
+
+3. **`auto_approve_with_log`** — silent re-application of prior decision. Logged to audit trail (the decision IS recorded, with reference to the original decision that authorized it) but doesn't surface to the reviewer. Reserved for LOW severity where the noise reduction is worth the reduced visibility.
+
+The middle option is the magic. It honors the L2 memory promise (don't make me re-litigate everything) while preserving human accountability (you saw it, you confirmed, your name is on the audit trail).
+
+**HITL gate UX when L2 hits:**
+
+> *"This finding was reviewed on 2026-03-15 by Jane Doe. Decision: ACCEPTED. Rationale: 'Vulnerable code path not exposed to user input.' Policy unchanged since then.*
+>
+> *[Confirm previous decision]   [Re-review in detail]"*
+
+That UX explicitly surfaces the original decision context AND gives the reviewer one-click confirmation. Audit trail records: "decision X reaffirmed by user Y at time Z, original decision A by user B."
 
 ### L3: Org Policy Store
 
