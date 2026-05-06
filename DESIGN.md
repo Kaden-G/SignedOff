@@ -1,0 +1,552 @@
+# DESIGN.md — PyPI Dependency Compliance Agent
+
+> **Status:** Pre-build architecture document
+> **Last updated:** May 6, 2026
+> **Hackathon:** lablab.ai "Transforming Enterprise Through AI" (May 11–19, 2026)
+> **Authors:** Kaden Godinez (backend/agents), Ashu Ravichander (UI/demo/presentation)
+
+---
+
+## Table of Contents
+
+1. [Product Vision](#product-vision)
+2. [The Problem](#the-problem)
+3. [Differentiation & Moat](#differentiation--moat)
+4. [Pipeline Architecture](#pipeline-architecture)
+5. [The Four Wickets](#the-four-wickets)
+6. [Technology Stack](#technology-stack)
+7. [State Schema (AgentState)](#state-schema-agentstate)
+8. [Citation Integrity Guardrails](#citation-integrity-guardrails)
+9. [Memory Architecture](#memory-architecture)
+10. [LangGraph Node Architecture](#langgraph-node-architecture)
+11. [API Contract (Backend ↔ Frontend)](#api-contract-backend--frontend)
+12. [Division of Labor](#division-of-labor)
+13. [Scope: In vs. Out for v1](#scope-in-vs-out-for-v1)
+14. [Submission Requirements](#submission-requirements)
+15. [Timeline](#timeline)
+16. [Open Questions / TBD](#open-questions--tbd)
+
+---
+
+## Product Vision
+
+An **autonomous compliance officer** for Python software supply chains. Given a repository or `requirements.txt`, the agent:
+
+1. Resolves the full dependency tree (direct + transitive)
+2. Checks every package's license against the user's declared use case
+3. Identifies known security vulnerabilities (CVEs)
+4. Generates contextualized risk scores accounting for use case
+5. Routes findings through a policy-driven decision gate with human-in-the-loop review
+6. Records every decision in a tamper-evident, citation-backed audit trail
+
+**One-line pitch:** "It's not a scanner — it's an autonomous compliance officer with a tamper-evident paper trail."
+
+---
+
+## The Problem
+
+Enterprise software teams face two intertwined dependency risks:
+
+**License compliance:** Open source packages come with license terms. A GPL-licensed dependency buried 4 levels deep in a transitive tree can infect a SaaS product with copyleft obligations. Existing tools (FOSSA, Black Duck, Mend) detect licenses but don't reason about *use case fit* — the same license can be compliant or violating depending on whether you're shipping SaaS, internal tooling, or a distributed binary.
+
+**Security vulnerabilities:** CVE data is noisy, stale, and context-free. Existing tools (Snyk, GitHub Dependabot) flag CVEs but don't prioritize by actual exploitability in the user's specific deployment. A CRITICAL CVE in a dev-only dependency that never touches production is low actual risk — but generic scanners can't tell the difference.
+
+**The gap:** Existing tools are **passive dashboards**. They tell you what's wrong. They don't reason about your context, propose specific remediation paths, or maintain an audit-defensible decision trail. They generate noise. Compliance teams drown in findings without prioritization.
+
+---
+
+## Differentiation & Moat
+
+### What we are NOT
+
+- Not another SBOM scanner (CycloneDX, Syft, etc. already do this)
+- Not another vulnerability database (OSV, NVD, GHSA already do this)
+- Not another license detector (FOSSA, FOSSology already do this)
+- Not a wrapper around an existing tool's API
+
+### What we ARE (and what makes this defensible)
+
+1. **Agentic remediation** — not just detection, but autonomous triage with structured remediation options (version bump, package swap, compensating control, accept-as-is)
+
+2. **Use-case-aware contextualization** — the same finding has different actual risk depending on deployment model. We reason about this with the LLM.
+
+3. **Policy-driven decision gates** — organizations declare their own risk tolerance via `POLICY.yml`. The agent applies the policy uniformly. No more inconsistent human judgment across reviewers.
+
+4. **Hash-chained audit trail** — every decision (auto or human) is logged with cryptographic tamper evidence. SOC 2, FedRAMP, CMMC auditors love this; existing tools don't have it.
+
+5. **Citation-backed claims** — every finding and remediation is backed by traceable, validated evidence. No hallucinated CVEs. No made-up package alternatives.
+
+### The "Landlord Rule" Defense
+
+> *"Most AI startups pay rent to the foundation model providers and to the data providers. This works until the landlord adds the feature."*
+
+Our defense:
+- **Foundation model:** abstracted via multi-provider interface (Claude/OpenAI). Not locked to one provider.
+- **Vulnerability data:** OSV.dev is open-source and free. NVD is government-funded. We don't depend on Snyk/Mend/FOSSA APIs.
+- **License data:** SPDX is an open standard with a downloadable static dataset.
+- **Our actual moat:** the orchestration layer (LangGraph agents + decision gates + audit trail). That's our code, not anyone else's.
+
+---
+
+## Pipeline Architecture
+
+```
+┌─────────────────┐
+│  User Input     │
+│  (repo / reqs)  │
+└────────┬────────┘
+         │
+┌────────▼────────┐
+│   InputNode     │  Validates input, loads POLICY.yml,
+│                 │  declares use_case
+└────────┬────────┘
+         │
+┌────────▼────────┐
+│   SBOMNode      │  Resolves full dependency tree,
+│                 │  checks L1 cache per package
+└────────┬────────┘
+    ┌────┴────┐
+    │         │
+┌───▼──┐ ┌───▼──┐
+│Lic.  │ │ CVE  │  Run concurrently (async)
+│ Node │ │ Node │  Both produce Findings with citations
+└───┬──┘ └───┬──┘
+    └────┬────┘
+         │
+┌────────▼────────┐
+│   RiskNode      │  Contextualizes license + security risk
+│                 │  separately. Routes to decision states.
+│                 │  Checks L2 memory for prior decisions.
+└────────┬────────┘
+         │
+    ┌────┼────┐
+    │    │    │
+┌───▼─┐ ┌▼──┐ ┌▼────┐
+│Auto │ │HIT│ │Auto │
+│Remed│ │L  │ │Acc. │
+└───┬─┘ └┬──┘ └┬────┘
+    │    │     │
+    └────┼─────┘
+         │
+┌────────▼────────┐
+│   AuditNode     │  Writes hash-chained audit trail
+└────────┬────────┘
+         │
+┌────────▼────────┐
+│   ReportNode    │  Generates final report + summary
+└─────────────────┘
+```
+
+---
+
+## The Four Wickets
+
+### Wicket 1: SBOM Generation
+
+**Goal:** Resolve the full dependency tree and produce a normalized package list.
+
+**Tools used (orchestrated, not reinvented):**
+- `pipdeptree` for tree resolution
+- `pip-licenses` for license metadata
+- CycloneDX format as standard SBOM output
+
+**Lock file priority:** `poetry.lock` > `Pipfile.lock` > pinned `requirements.txt` > unpinned `requirements.txt`
+
+**Hard edge case (v2 scope):** Packages with C extensions or optional dependencies that only resolve at install time. v1 flags these; v2 will support a sandbox install mode for accurate resolution.
+
+### Wicket 2: License Compliance
+
+**Goal:** Classify each package's license and determine compatibility with the user's declared use case.
+
+**Approach:**
+- Use `pip-licenses` for primary license metadata
+- Fallback: check the package's GitHub repo for a LICENSE file when PyPI metadata is missing
+- Use SPDX license identifiers as canonical format
+- LLM reasons about license vs. use case compatibility (constrained to grounding data — see Citation Integrity Guardrails)
+
+**Use cases supported (v1):**
+- `saas` — software delivered as a service over network
+- `internal` — internal tooling, never distributed
+- `distributed_binary` — shipped to end users as installable package
+
+**Recommendation engine:** When a license is incompatible, propose alternatives via a hybrid approach:
+- Curated mapping (20-30 most common packages, manually verified)
+- LLM inference fallback (flagged as low confidence, requires human review)
+
+### Wicket 3: CVE / Vulnerability Mapping
+
+**Goal:** Identify and contextually prioritize known vulnerabilities.
+
+**Data sources (priority order):**
+1. **OSV.dev** — primary, has a clean REST API and Python SDK
+2. **GitHub Advisory Database** — secondary
+3. **PyPI vulnerabilities endpoint** — tertiary
+4. **NVD** — fallback (has known backlog issues)
+
+**Value-add over raw `pip-audit`:**
+- LLM reasons about exploitability in the user's specific use case
+- Incorporates fix availability into prioritization
+- Distinguishes between "needs immediate patch" and "monitor for upstream fix"
+
+### Wicket 4: Risk Matrix + Decision Gate
+
+**Goal:** Combine license and security findings into actionable risk decisions with human-in-the-loop review.
+
+**Architectural principle: License risk and security risk are NEVER fused.** They're presented as parallel dimensions because:
+- Different remediation paths
+- Different decision-makers (legal/compliance vs. security)
+- Different temporal urgency (long-term vs. immediate)
+- Different audit lifetime (permanent vs. time-bounded)
+
+**Risk matrix UI presentation:**
+
+| Package | License Risk | Security Risk | Action |
+|---|---|---|---|
+| requests 2.28 | NONE | HIGH | Review CVE |
+| somelib 1.0 | CRITICAL | NONE | Replace pkg |
+| oldlib 0.9 | MEDIUM | MEDIUM | Two-track review |
+
+**Decision routing (driven by `POLICY.yml`):**
+- Severity below `auto_remediate_below` threshold → `AUTO_REMEDIATE`
+- Severity below `auto_accept_below` threshold → `ACCEPTED`
+- Everything else → `HUMAN_REVIEW`
+
+**Auto-remediate is gated:** A finding with only `LLM_INFERENCE` or `NONE_FOUND` citations CANNOT be auto-remediated regardless of policy threshold. Always routes to `HUMAN_REVIEW`.
+
+---
+
+## Technology Stack
+
+| Layer | Choice | Why |
+|---|---|---|
+| Agent orchestration | **LangGraph** | Conditional branching, agent-to-agent state, async support. Better fit than Prefect for this graph shape. |
+| LLM provider | Multi-provider abstraction (Claude primary, OpenAI fallback) | Avoid foundation-model lock-in (Landlord Rule) |
+| SBOM tooling | `pipdeptree`, `pip-licenses` | Mature, PyPA-maintained, well-documented |
+| SBOM format | **CycloneDX** | Industry standard, machine-readable |
+| Vulnerability data | **OSV.dev** primary, GHSA secondary | Open, free, current, has Python SDK |
+| License data | **SPDX** static dataset | Open standard, machine-readable, no API dependency |
+| Backend API | **FastAPI** | Async-native, OpenAPI auto-generation for Ashu's frontend |
+| Frontend | **Lovable** (React) + Figma mockups | Ashu's tooling, ships fast |
+| Deployment | TBD (Railway, Render, Fly.io, or HF Spaces) | Must be publicly accessible per lablab.ai requirements |
+| State store | In-memory for v1, with cache layer | Sufficient for hackathon scope |
+
+---
+
+## State Schema (AgentState)
+
+The full schema lives in `agent_state.py`. Key design decisions:
+
+### Top-level structure (lifecycle order)
+
+```
+Input Layer       → job_id, input_type, input_value, use_case, policy
+SBOM Layer        → raw_dependency_tree, packages
+License + CVE     → license_findings, cve_findings  (concurrent)
+Risk Layer        → risk_matrix, risk_summary
+Decision Layer    → pending_human_review, resolved_findings
+Audit Layer       → audit_trail (hash-chained, append-only)
+Meta Layer        → errors, status
+```
+
+### Core types
+
+**`PackageRecord`** — normalized record per (name, version) pair. Carries:
+- License metadata + status
+- Raw CVE list
+- **`license_risk`** AND **`security_risk`** (separate, never fused)
+- Cache provenance (`from_cache`, `cached_at`)
+- `transitive` flag (direct vs. transitive dep)
+
+**`Finding`** — one actionable issue per package. Carries:
+- `finding_type` (license_violation, cve, etc.)
+- `severity` (raw, before contextualization)
+- `recommendation` (one-liner) + `remediations` (structured options)
+- `citations` (REQUIRED, non-empty)
+- `decision_status` lifecycle
+- `prior_decision` (L2 memory hit)
+
+**`Remediation`** — structured fix option. Types: `VERSION_BUMP`, `PACKAGE_SWAP`, `CONFIG_CHANGE`, `COMPENSATING_CONTROL`, `NO_FIX_AVAILABLE`, `ACCEPT_AS_IS`. Each carries its own citations.
+
+**`Citation`** — evidence record. REQUIRED on every Finding and Remediation. Carries:
+- `source` (OSV, NVD, SPDX, LLM_INFERENCE, NONE_FOUND, etc.)
+- `url`, `identifier`, `excerpt`
+- `retrieved_at` timestamp
+- `confidence` (authoritative / reliable / inferred / none)
+- `validated` boolean + `validation_method`
+- `content_hash` (SHA-256 for tamper detection)
+
+### Concurrency safety
+
+Two fields use `Annotated[list, operator.add]` reducers so multiple nodes can safely append concurrently:
+- `audit_trail` (multiple nodes log events)
+- `errors` (parallel nodes may report non-fatal errors)
+
+---
+
+## Citation Integrity Guardrails
+
+Hallucinated citations would be **catastrophic** for an enterprise compliance tool. The system enforces three layers of defense:
+
+### Layer 1: Architectural — LLMs Don't Generate Citations Directly
+
+- All authoritative citations come from API responses or static reference data
+- Code FETCHES the evidence; LLM INTERPRETS it
+- LLM_INFERENCE citations carry `url=None` — no field for the LLM to hallucinate a URL into
+
+**Required LLM prompting pattern:**
+
+```
+❌ NEVER: "What CVEs affect requests==2.28.0?"
+   (LLM may hallucinate from training data)
+
+✅ ALWAYS: "Here is the OSV API response: [actual JSON].
+   Summarize the vulnerabilities described in this response.
+   Do not include any vulnerabilities not present in the input."
+   (LLM constrained to grounding data we already verified)
+```
+
+### Layer 2: Validation — Verify Every Citation Before Acceptance
+
+- URL liveness check (HTTP HEAD, 2xx required) for URL citations
+- Identifier format check (regex patterns) for identifier citations
+- Failed validations → citation marked `validated=False`, finding confidence downgraded automatically
+- Failed validations are LOGGED in `errors`, not silently dropped
+
+### Layer 3: Explicit Absence — NONE_FOUND
+
+- Empty citation lists are NEVER allowed
+- When no evidence is found, use a `NONE_FOUND` citation
+- Forces absence of evidence to be a **positive signal** in the UI rather than ambiguous missing data
+- Findings with only `NONE_FOUND` or `LLM_INFERENCE` citations:
+  - Cannot be auto-remediated
+  - Cannot display "high confidence"
+  - Always route to `HUMAN_REVIEW`
+
+### Tamper Detection (Two Independent Checks)
+
+1. **Audit trail hash chain** — temporal integrity. Tampering with any past entry breaks all subsequent hashes.
+2. **Citation `content_hash`** — content integrity. SHA-256 of canonical Citation serialization, computed once at creation, cross-referenced with the audit trail entry that recorded the Citation.
+
+To hide tampering, an attacker would have to modify Citation in state, recompute its content_hash, modify the audit_trail entry that recorded the original creation, recompute that audit entry's hash, AND recompute every subsequent audit entry's hash. Practically infeasible.
+
+---
+
+## Memory Architecture
+
+Three layers, each with a distinct purpose:
+
+### L1: Package Cache
+
+**Key:** `package_name + version`
+**Stores:** license metadata, known CVEs, SPDX classification
+**TTL:** 7 days (CVEs change)
+**Purpose:** Latency reduction. Most packages are scanned repeatedly across runs.
+
+### L2: Decision Memory
+
+**Key:** `package + version + finding_type + use_case + policy_hash`
+**Stores:** prior human decisions, accepted risks, rationale
+**TTL:** None (this is an audit artifact)
+**Purpose:** "We already reviewed this." When a finding hits L2, the HITL gate surfaces:
+
+> *"This finding was reviewed on [date] and accepted with rationale: [X]. Policy unchanged. Recommend confirm or re-review."*
+
+This is the actual differentiator vs. existing tools. Compliance teams hate re-litigating decisions.
+
+### L3: Org Policy Store
+
+**Key:** Per-organization
+**Stores:** `POLICY.yml` parsed contents + derived rules
+**Updated:** Manually, version-controlled
+**Purpose:** Inject consistent policy context into every agent run
+
+### Cache Invalidation (v2 scope)
+
+For v1, every L1 entry is stamped with `cached_at` and `ttl_days`. The actual scheduler/invalidation logic is v2 — don't build now.
+
+---
+
+## LangGraph Node Architecture
+
+### Node responsibilities
+
+| Node | Reads from state | Writes to state | Notes |
+|---|---|---|---|
+| `InputNode` | (input args) | `job_id`, `input_type`, `input_value`, `use_case`, `policy`, `status` | Validates POLICY.yml, normalizes input |
+| `SBOMNode` | input fields | `raw_dependency_tree`, `packages` | Checks L1 cache per package |
+| `LicenseNode` | `packages`, `use_case`, `policy` | `license_findings`, updates `packages[*].license_status` | Async, parallel with CVENode |
+| `CVENode` | `packages`, `use_case`, `policy` | `cve_findings`, updates `packages[*].cves` | Async, parallel with LicenseNode |
+| `RiskNode` | `packages`, `license_findings`, `cve_findings`, `policy` | `risk_matrix`, `risk_summary`, sets `packages[*].license_risk` and `[*].security_risk`, routes to `pending_human_review` or `resolved_findings` | Checks L2 decision memory |
+| `DecisionGateNode` | `pending_human_review` | Updates `resolved_findings` with human decisions | Pauses pipeline; LangGraph interrupt pattern |
+| `AutoRemediateNode` | findings with `decision_status=AUTO_REMEDIATE` | Updates `resolved_findings` | v2 stretch goal: opens PRs |
+| `AuditNode` | All resolved state | `audit_trail` (hash-chained appends) | Runs continuously, also at terminal events |
+| `ReportNode` | All terminal state | Returns final report | Generates executive summary + full findings |
+
+### Async opportunity
+
+`LicenseNode` and `CVENode` run **concurrently** after SBOM resolves. That's where most of the latency lives.
+
+---
+
+## API Contract (Backend ↔ Frontend)
+
+FastAPI exposes these endpoints for Ashu's Lovable frontend:
+
+```
+POST /scan/start
+  Body: { input_type, input_value, use_case, policy }
+  Returns: { job_id }
+
+GET  /scan/status/{job_id}
+  Returns: { status, progress, errors }
+  Polled by frontend for real-time updates
+
+GET  /scan/results/{job_id}
+  Returns: full findings (SBOM, licenses, CVEs)
+
+GET  /scan/risk-matrix/{job_id}
+  Returns: risk matrix with parallel license + security dimensions
+
+GET  /scan/pending-review/{job_id}
+  Returns: findings awaiting human decision
+
+POST /scan/decision/{finding_id}
+  Body: { decision_status, rationale }
+  Updates a finding's decision
+
+GET  /audit/trail/{job_id}
+  Returns: hash-chained audit log
+
+GET  /audit/verify/{job_id}
+  Returns: integrity check results (hash chain valid? content hashes match?)
+```
+
+Ashu mocks these in Figma/Lovable against fake data while Kaden builds the real implementations. Swap to live API on Day 4-5.
+
+---
+
+## Division of Labor
+
+Established Day 1, no overlap:
+
+| Kaden owns | Ashu owns |
+|---|---|
+| All LangGraph agent logic | Figma mockups (Day 1-2) |
+| OSV / PyPI / SPDX integrations | Lovable frontend build (Day 3-5) |
+| `POLICY.yml` schema | Dashboard polish + UX |
+| `AgentState` schema | Demo video + presentation |
+| Audit trail + HITL gate | Pitch deck |
+| Backend FastAPI surface | Submission writeup |
+| Cache layer | Cover image |
+| Citation validation | Live demo presentation |
+
+**Q&A on demo day:** Ashu takes business/product questions, Kaden takes technical questions.
+
+---
+
+## Scope: In vs. Out for v1
+
+### IN (hackathon v1)
+
+✅ PyPI ecosystem only (no npm, Maven, etc.)
+✅ SBOM via `pipdeptree` orchestration
+✅ License compliance via `pip-licenses` + SPDX + LLM reasoning
+✅ CVE detection via OSV.dev
+✅ Use-case-aware risk contextualization
+✅ Separate license_risk + security_risk dimensions
+✅ Structured remediations with citation backing
+✅ Citation validation (URL liveness, format checks)
+✅ NONE_FOUND explicit absence markers
+✅ L1 package cache + L2 decision memory
+✅ Hash-chained audit trail
+✅ Citation content hashes
+✅ POLICY.yml driven decision routing
+✅ Human-in-the-loop gate via LangGraph interrupt
+✅ FastAPI backend exposed for Lovable frontend
+✅ Risk matrix dashboard (Ashu)
+✅ Demo video + pitch deck + submission writeup
+
+### OUT (v2+)
+
+❌ Cache invalidation scheduler (just stamp `cached_at` for now)
+❌ Sandbox install mode for hard edge case packages
+❌ Auto-PR remediation (open PRs to bump versions)
+❌ Multi-ecosystem support (npm, Maven, Go, etc.)
+❌ Reachability analysis (does the vulnerable code path apply?)
+❌ Static analysis to infer use case from codebase
+❌ Persistent database (in-memory state for hackathon)
+❌ Multi-tenant / org isolation
+❌ SSO / RBAC for the dashboard
+❌ Webhook integrations (Slack, Jira, etc.)
+
+---
+
+## Submission Requirements
+
+Per lablab.ai documentation:
+
+**Required deliverables:**
+- Working prototype accessible online (publicly reachable URL)
+- Video presentation (demo of the project)
+- Pitch deck (slides)
+
+**Submission form fields:**
+- Title (max 50 characters)
+- Short description (max 255 characters)
+- Long description (minimum 100 words)
+- Main tracks (select categories)
+- Technologies (list everything used)
+- Cover image (16:9 ratio recommended)
+- Additional info (how it scales beyond hackathon)
+
+**Track alignment:** Enterprise security challenge — *"Build AI systems that enterprise security teams can actually trust and deploy."*
+
+---
+
+## Timeline
+
+| Date | Milestone |
+|---|---|
+| **May 6 (today)** | Architecture + schema design, repo scaffolding |
+| **May 6-10** | Pre-build prep: validate APIs, design POLICY.yml, test fixtures, environment setup. **No submission code committed.** |
+| **May 11** | Build window opens. Real implementation starts. |
+| **May 11-12** | InputNode, SBOMNode, basic FastAPI scaffold. Ashu starts Figma mockups. |
+| **May 13-14** | LicenseNode + CVENode (parallel async), citation validation. Ashu starts Lovable build. |
+| **May 15-16** | RiskNode, decision gate, L1 cache, L2 memory. Ashu refines dashboard against real API. |
+| **May 17** | **Real internal deadline.** AuditNode, hash chain, end-to-end integration. Demo video drafted. |
+| **May 18** | Polish, dry runs, hybrid build day. Pitch deck finalized. |
+| **May 19** | Demos & Awards at San Jose Convention Center. |
+
+**Hard deadline mindset:** Treat May 17 as the actual deadline. May 18-19 is polish + rehearsal.
+
+---
+
+## Open Questions / TBD
+
+- [ ] **POLICY.yml schema** — full structure not yet designed. Next session.
+- [ ] **Project name** — candidates: DepGuard, PacketWatch, ChainAudit, others TBD
+- [ ] **Deployment target** — Railway vs. Render vs. Fly.io vs. HF Spaces. Cost is $0 for hackathon scope; choose based on ease of FastAPI deployment.
+- [ ] **Live demo confirmation** — will all teams demo or only finalists? (Pending Discord clarification)
+- [ ] **Curated PACKAGE_SWAP mapping** — which 20-30 packages to include in v1 (likely focus on web frameworks, HTTP clients, ORM/DB, testing, common ML)
+- [ ] **Submission title + short description** — pre-draft before May 11
+
+---
+
+## Reference: Files in This Project
+
+| File | Purpose |
+|---|---|
+| `DESIGN.md` | This document — master architecture reference |
+| `agent_state.py` | Full state schema (TypedDicts, enums, citations) |
+| `policy_schema.yml` | (TBD) POLICY.yml structure + examples |
+| `nodes/*.py` | (TBD) Individual LangGraph node implementations |
+| `graph.py` | (TBD) LangGraph state graph definition |
+| `api.py` | (TBD) FastAPI endpoints |
+| `cache/*.py` | (TBD) L1 + L2 memory implementations |
+| `audit/*.py` | (TBD) Hash chain + citation validation |
+| `tests/*.py` | (TBD) Test fixtures with known CVEs and license issues |
+| `README.md` | (TBD) Public-facing project README for submission |
+
+---
+
+*This document is the canonical reference for design decisions. When in doubt during implementation, this wins. Update as decisions evolve.*
