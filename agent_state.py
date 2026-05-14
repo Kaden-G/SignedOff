@@ -805,9 +805,25 @@ class AgentState(TypedDict):
     # Never overwrite. Never delete. This is the compliance record.
     # -----------------------------------------------------------------------
 
+    audit_events: Annotated[list[dict], operator.add]
+    # Staging buffer for raw, NOT-YET-hash-chained events emitted by every
+    # node during the scan. Each entry has the shape:
+    #   {
+    #     "timestamp": str,    # ISO 8601, set by the producing node
+    #     "event_type": str,   # "scan_started" | "sbom_resolved" |
+    #                          #   "license_scanned" | "cve_scanned" |
+    #                          #   "decision_made" | etc.
+    #     "payload": dict,     # event-specific data
+    #   }
+    # AuditNode runs last, sorts these by timestamp, and writes the
+    # hash-chained `audit_trail` below in a single deterministic pass.
+    # The operator.add reducer is REQUIRED here — LicenseNode and CVENode
+    # run in parallel and would otherwise clobber each other's writes.
+
     audit_trail: Annotated[list[dict], operator.add]
     # Hash-chained append-only log of every significant event in the scan.
-    # Each entry is a dict with structure:
+    # Written by AuditNode by sealing `audit_events` (above) into a chain.
+    # Each entry has the structure:
     #   {
     #     "seq": int,              # monotonic sequence number
     #     "timestamp": str,        # ISO 8601
