@@ -9,7 +9,7 @@
 # --- CVE FINDINGS (security) ---
 #
 #   CRITICAL
-#     django==4.2.3
+#     django==4.2.30
 #       CVE-2024-42005  SQL injection via QuerySet.annotate() / Q() on MySQL
 #       CVE-2024-41989  ReDoS in Truncator.words() with html=True
 #       → Fix: upgrade to django==4.2.14 (or 5.0.7)
