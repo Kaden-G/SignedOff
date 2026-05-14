@@ -531,7 +531,7 @@ class Remediation(TypedDict):
     #     functional equivalence
 
 
-
+class Finding(TypedDict):
     """
     A single actionable compliance or security finding for one package.
 
