@@ -1,0 +1,305 @@
+# ==============================================================================
+# POLICY.yml — SignedOff Compliance Policy Configuration
+# ==============================================================================
+#
+# This file is the organization's declarative risk tolerance contract.
+# It is loaded ONCE by InputNode and carried through AgentState for the
+# entire scan. No node re-reads this file — they read state["policy"].
+#
+# Every auto-decision made by the agent references a specific policy rule.
+# The audit trail records WHICH rule triggered WHICH decision, so auditors
+# can trace "why did this get auto-accepted?" back to this file.
+#
+# VERSION CONTROL THIS FILE. Treat it like code. The policy_hash field
+# (SHA-256 of this file's contents) is embedded in every L2 decision memory
+# key — so a policy change automatically invalidates prior L2 hits and forces
+# human re-review. That's intentional.
+#
+# Schema version: 1.0
+# ==============================================================================
+
+schema_version: "1.0"
+
+# ------------------------------------------------------------------------------
+# Organization Identity
+# Used in report headers and audit trail metadata.
+# ------------------------------------------------------------------------------
+org:
+  name: "Your Organization Name"
+  contact: "security@yourorg.com"   # Who gets notified on CRITICAL findings
+
+
+# ------------------------------------------------------------------------------
+# Scan Defaults
+# These are the fallback values when a scan does not explicitly declare them.
+# The POST /scan/start endpoint can override these per-scan.
+# ------------------------------------------------------------------------------
+scan_defaults:
+
+  # Declared deployment/distribution model for this organization.
+  # Drives ALL license compatibility reasoning.
+  # Options: saas | internal | distributed_binary
+  #
+  # saas              — software delivered as a service over the network.
+  #                     GPL is generally okay (no distribution), AGPL is not
+  #                     (network use triggers copyleft). LGPL is fine.
+  # internal          — tooling never distributed outside the org.
+  #                     Most licenses are compatible. GPL/AGPL generally okay.
+  # distributed_binary — shipped to end users as an installable package.
+  #                     GPL/LGPL linking model matters. Most restrictive context.
+  #
+  # This field is injected into every LLM prompt that reasons about license
+  # compatibility. It is the single most important field in this file.
+  use_case: "saas"
+
+  # Whether to include transitive dependencies in the scan.
+  # true  = full dependency tree (recommended — transitive CVEs are real risk)
+  # false = direct dependencies only (faster, less complete)
+  include_transitive: true
+
+  # Maximum depth of transitive dependency tree to resolve.
+  # null = no limit (full tree). Set to 3-5 for very large projects
+  # where deep transitive deps have negligible actual risk.
+  max_depth: null
+
+
+# ------------------------------------------------------------------------------
+# Risk Thresholds
+# Control when the agent acts automatically vs. routes to human review.
+# Thresholds are evaluated SEPARATELY for license and security findings —
+# never as a combined score.
+#
+# Valid values: critical | high | medium | low | none
+# "below X" means: severity is LESS SEVERE than X.
+#   auto_remediate_below: high  → LOW and MEDIUM get auto-remediated
+#   auto_accept_below: low      → only NONE gets auto-accepted
+# ------------------------------------------------------------------------------
+thresholds:
+
+  license:
+    # Findings below this severity are automatically queued for remediation
+    # without human review. Only applies if citations are authoritative
+    # (NONE_FOUND / LLM_INFERENCE-only findings always go to HUMAN_REVIEW).
+    auto_remediate_below: "medium"   # LOW license issues auto-remediated
+
+    # Findings below this severity are automatically accepted (logged, no action).
+    # Must be strictly less severe than auto_remediate_below.
+    auto_accept_below: "low"         # NONE severity = clean, auto-accepted
+
+  security:
+    # CVE findings below this severity are automatically queued for remediation.
+    auto_remediate_below: "high"     # LOW + MEDIUM CVEs auto-remediated
+
+    # CVE findings below this severity are automatically accepted.
+    auto_accept_below: "low"         # NONE severity = no CVEs, auto-accepted
+
+  # Hard override: findings backed ONLY by LLM_INFERENCE or NONE_FOUND
+  # citations ALWAYS route to HUMAN_REVIEW regardless of the thresholds above.
+  # This cannot be disabled. It is an architectural invariant, not a policy knob.
+  # (documented here for clarity, not because you can change it)
+  llm_inference_always_human_review: true   # read-only, do not change
+
+
+# ------------------------------------------------------------------------------
+# License Lists
+# Explicit allow/block lists take precedence over LLM license reasoning.
+# These are evaluated BEFORE the LLM is invoked — fast-path decisions.
+#
+# Use SPDX identifiers: https://spdx.org/licenses/
+# The LLM is only invoked for licenses not on either list.
+# ------------------------------------------------------------------------------
+licenses:
+
+  # Licenses explicitly approved for the declared use_case.
+  # Findings for packages with these licenses are auto-accepted (no review).
+  # Extend this list as your legal team approves additional licenses.
+  allowed:
+    - "MIT"
+    - "Apache-2.0"
+    - "BSD-2-Clause"
+    - "BSD-3-Clause"
+    - "ISC"
+    - "Python-2.0"        # PSF license (used by Python stdlib itself)
+    - "Unlicense"
+    - "CC0-1.0"
+    - "WTFPL"             # yes, it's a real SPDX identifier
+
+  # Licenses explicitly blocked regardless of use_case.
+  # Findings for packages with these licenses are always CRITICAL severity
+  # and always route to HUMAN_REVIEW. No auto-remediation.
+  blocked:
+    - "GPL-2.0-only"
+    - "GPL-2.0-or-later"
+    - "GPL-3.0-only"
+    - "GPL-3.0-or-later"
+    - "AGPL-3.0-only"
+    - "AGPL-3.0-or-later"
+    - "SSPL-1.0"          # MongoDB's non-OSI license, functionally AGPL-like
+    - "BUSL-1.1"          # Business Source License — not OSI-approved
+    - "Commons-Clause"    # Not an SPDX license but appears in the wild
+
+  # Licenses that require LLM reasoning before a decision is made.
+  # If a license is not on allowed or blocked, it falls through to LLM analysis.
+  # You can explicitly enumerate known-gray-area licenses here for documentation
+  # purposes — they'll still go to LLM, but it signals intent.
+  requires_review:
+    - "LGPL-2.0-only"
+    - "LGPL-2.0-or-later"
+    - "LGPL-2.1-only"
+    - "LGPL-2.1-or-later"
+    - "LGPL-3.0-only"
+    - "LGPL-3.0-or-later"
+    - "MPL-2.0"           # Mozilla Public License — file-level copyleft
+    - "CDDL-1.0"
+    - "EPL-1.0"
+    - "EPL-2.0"
+    - "EUPL-1.2"
+
+  # What to do when license metadata is completely missing from PyPI
+  # AND the GitHub LICENSE file fallback also fails.
+  # Options: human_review | blocked | warn_and_continue
+  unknown_license_action: "human_review"
+
+
+# ------------------------------------------------------------------------------
+# CVE / Vulnerability Policy
+# Controls how security findings are handled beyond the risk thresholds above.
+# ------------------------------------------------------------------------------
+vulnerabilities:
+
+  # CVSS score → RiskLevel mapping.
+  # Override these if your org uses a different severity calibration.
+  cvss_mapping:
+    critical_threshold: 9.0    # CVSS >= 9.0 → CRITICAL
+    high_threshold: 7.0        # CVSS >= 7.0 → HIGH
+    medium_threshold: 4.0      # CVSS >= 4.0 → MEDIUM
+                               # CVSS <  4.0 → LOW
+
+  # How to handle CVEs with no available fix (NO_FIX_AVAILABLE remediations).
+  # Options: human_review | auto_accept_with_log | escalate
+  no_fix_available_action: "human_review"
+
+  # How to handle transitive dependency CVEs differently from direct dep CVEs.
+  # Transitive CVEs are real risk but remediation is indirect (bump the direct
+  # dep that pulls in the vulnerable transitive, or accept it).
+  transitive_cvs_severity_adjustment: "none"
+  # Options:
+  #   none       — treat transitive and direct CVEs identically
+  #   downgrade  — reduce severity by one level for transitive deps
+  #                (e.g. HIGH → MEDIUM) to reflect reduced control
+  #   flag_only  — surface as informational, never auto-remediate
+
+
+# ------------------------------------------------------------------------------
+# L2 Decision Memory
+# Controls how prior human decisions are replayed on subsequent scans.
+#
+# Context: L2 memory key = package:version:finding_type:use_case:policy_hash
+# A policy change (new policy_hash) invalidates ALL prior L2 hits and forces
+# fresh human review. This is intentional — policy drift should not silently
+# inherit old decisions.
+#
+# Four modes per severity level:
+#
+#   always_resurface
+#     Prior decision is shown but the finding is treated as PENDING.
+#     Reviewer MUST engage fresh. No shortcuts. Their name goes on the
+#     new decision. Appropriate for CRITICAL — the stakes are too high
+#     to rubber-stamp.
+#
+#   show_for_confirmation
+#     Prior decision is shown prominently with a "Confirm previous decision"
+#     one-click button. Reviewer can confirm in 2 seconds OR drill in.
+#     Audit trail records: "decision reaffirmed by [user] at [time],
+#     original decision by [user] on [date]."
+#     Appropriate for HIGH/MEDIUM — respects reviewer's time without
+#     removing accountability.
+#
+#   auto_accept_with_log
+#     Prior decision is automatically re-applied. No human interaction.
+#     BUT: audit trail records a prominent entry: "Prior decision auto-applied.
+#     Human did not re-review. Original decision by [user] on [date]."
+#     Never silent — the absence of re-review is itself an audit artifact.
+#     Appropriate for LOW — noise reduction worth the reduced visibility.
+#
+#   always_resurface_with_context  (same as always_resurface but with
+#     the prior decision, rationale, and any changed context surfaced
+#     to the reviewer before they engage — default for CRITICAL)
+# ------------------------------------------------------------------------------
+prior_decisions:
+
+  critical:
+    mode: "always_resurface"
+    # CRITICAL findings must always be reviewed fresh.
+    # Prior context is shown (helpful) but decision must be re-made.
+
+  high:
+    mode: "show_for_confirmation"
+    # One-click confirm or re-review. Reviewer's name on audit trail either way.
+    # Switch to "always_resurface" if your compliance posture is strict.
+
+  medium:
+    mode: "show_for_confirmation"
+    # Same as HIGH for now. Switch to "auto_accept_with_log" if alert
+    # fatigue becomes a problem in production.
+
+  low:
+    mode: "auto_accept_with_log"
+    # Automatically re-applies prior decision.
+    # Audit trail records it explicitly — never silent.
+    # Human did not re-review — that IS the audit artifact.
+
+  # Hard rule: findings backed only by LLM_INFERENCE or NONE_FOUND citations
+  # are always escalated to show_for_confirmation minimum, regardless of mode.
+  # This cannot be overridden.
+  llm_inference_minimum_mode: "show_for_confirmation"  # read-only
+
+
+# ------------------------------------------------------------------------------
+# Remediation Preferences
+# Hints to RiskNode and AutoRemediateNode about preferred fix strategies.
+# ------------------------------------------------------------------------------
+remediation:
+
+  # Preferred remediation type when multiple options exist.
+  # The agent will still surface all options — this controls which is shown first.
+  preferred_order:
+    - "version_bump"          # lowest risk, highest confidence
+    - "compensating_control"  # no dep change needed
+    - "config_change"         # code change but not dep change
+    - "package_swap"          # higher effort, API differences likely
+    - "accept_as_is"          # last resort, requires explicit rationale
+    - "no_fix_available"      # informational
+
+  # Whether to attempt auto-remediation for VERSION_BUMP findings
+  # that are below the auto_remediate_below threshold.
+  # v1: this just marks the finding AUTO_REMEDIATE in state.
+  # v2: this will open a PR.
+  auto_remediate_version_bumps: true
+
+  # Package swap remediations ALWAYS require human review.
+  # API differences make these too risky to auto-apply.
+  # This cannot be disabled.
+  package_swap_always_human_review: true   # read-only
+
+
+# ------------------------------------------------------------------------------
+# Reporting
+# Controls what goes into the final scan report.
+# ------------------------------------------------------------------------------
+reporting:
+
+  # Include packages with NONE risk (fully compliant, no CVEs) in the report.
+  # true  = full inventory (good for audits — proves you checked everything)
+  # false = findings-only (shorter report, easier for engineers to action)
+  include_clean_packages: true
+
+  # Include the full raw OSV API response in the audit trail payload.
+  # true  = complete evidence (larger audit files, but fully auditable)
+  # false = summary only (smaller files, less raw evidence)
+  include_raw_api_responses: true
+
+  # Executive summary generation.
+  # The LLM generates a plain-language summary for non-technical stakeholders.
+  generate_executive_summary: true
+  executive_summary_audience: "non-technical"   # non-technical | technical | both
