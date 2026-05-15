@@ -793,10 +793,16 @@ class AgentState(TypedDict):
     # pipeline pauses at DecisionGateNode until all are resolved.
     # The UI surfaces these as action items requiring attention.
 
-    resolved_findings: list[Finding]
+    resolved_findings: Annotated[list[Finding], operator.add]
     # All findings with a terminal decision_status (ACCEPTED, AUTO_REMEDIATE,
-    # DEFERRED). Populated by both RiskNode (auto-decisions) and
-    # DecisionGateNode (human decisions).
+    # DEFERRED). Populated by RiskNode (auto-decisions) AND incrementally
+    # by DecisionGateNode each time a human resolves a finding. The
+    # operator.add reducer is REQUIRED here — without it DecisionGateNode's
+    # append on resume would clobber RiskNode's auto-decided findings
+    # (last-write-wins under default merge semantics).
+    #
+    # pending_human_review intentionally has NO reducer — DecisionGateNode
+    # needs to *replace* it with the shrinking remainder, not append.
 
     # -----------------------------------------------------------------------
     # Audit Layer
