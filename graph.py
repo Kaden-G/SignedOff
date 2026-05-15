@@ -191,7 +191,7 @@ def route_after_input(state: AgentState) -> str:
     return "sbom_node"
 
 
-def route_after_sbom(state: AgentState) -> str:
+def route_after_sbom(state: AgentState) -> list[str]:
     """
     Guard after SBOMNode.
 
@@ -200,21 +200,19 @@ def route_after_sbom(state: AgentState) -> str:
     short-circuit to audit (records the attempt) then report (surfaces
     the error to the user).
 
-    On success, fan out to parallel license + CVE analysis.
+    On success, returns BOTH downstream analysis nodes — LangGraph
+    interprets a list return from a conditional-edge router as a fan-out
+    and fires both branches in parallel.
     """
     if state.get("status") == "failed":
-        return "audit_node"
+        return ["audit_node"]
 
     if not state.get("packages"):
         # No packages found — not a fatal error, but nothing to analyze.
         # AuditNode will record the empty scan. ReportNode will surface it.
-        return "audit_node"
+        return ["audit_node"]
 
-    # Normal path — fan out to both analysis nodes simultaneously.
-    # Returning a string here means "go to this node" — the parallel
-    # fan-out to BOTH license_node AND cve_node is declared as explicit
-    # edges in the graph definition below, not via this router.
-    return "parallel_analysis"  # sentinel — see add_conditional_edges below
+    return ["license_node", "cve_node"]
 
 
 # ---------------------------------------------------------------------------
@@ -256,14 +254,9 @@ def build_graph() -> StateGraph:
     # ------------------------------------------------------------------
     # input_node → sbom_node (or END on fatal error)
     # ------------------------------------------------------------------
-    builder.add_conditional_edges(
-        "input_node",
-        route_after_input,
-        {
-            "sbom_node": "sbom_node",
-            END: END,
-        }
-    )
+    # path_map omitted: the router returns the literal node name (or END),
+    # which modern LangGraph (>=0.2) uses directly as the destination.
+    builder.add_conditional_edges("input_node", route_after_input)
 
     # ------------------------------------------------------------------
     # sbom_node → [license_node, cve_node] in parallel
@@ -274,14 +267,9 @@ def build_graph() -> StateGraph:
     #
     # The conditional edge handles the empty-packages short-circuit.
     # ------------------------------------------------------------------
-    builder.add_conditional_edges(
-        "sbom_node",
-        route_after_sbom,
-        {
-            "parallel_analysis": ["license_node", "cve_node"],  # true parallel
-            "audit_node": "audit_node",                         # empty/failed
-        }
-    )
+    # Router returns either ["license_node", "cve_node"] (fan-out) or
+    # ["audit_node"] (short-circuit). path_map omitted by design.
+    builder.add_conditional_edges("sbom_node", route_after_sbom)
 
     # ------------------------------------------------------------------
     # license_node → risk_node  (fan-in leg 1)
@@ -301,16 +289,9 @@ def build_graph() -> StateGraph:
     # findings in multiple decision buckets. Most real scans will have
     # findings in at least two buckets (some HITL, some auto).
     # ------------------------------------------------------------------
-    builder.add_conditional_edges(
-        "risk_node",
-        route_after_risk,
-        {
-            "decision_gate_node":  "decision_gate_node",
-            "auto_remediate_node": "auto_remediate_node",
-            "auto_accept_node":    "auto_accept_node",
-            "audit_node":          "audit_node",   # clean project path
-        }
-    )
+    # route_after_risk returns a list of destination node names; LangGraph
+    # fires all of them in parallel.
+    builder.add_conditional_edges("risk_node", route_after_risk)
 
     # ------------------------------------------------------------------
     # decision_gate_node → audit_node (or loop back to self)
@@ -320,14 +301,7 @@ def build_graph() -> StateGraph:
     # LangGraph resumes here. route_to_audit checks whether ALL findings
     # are resolved before proceeding.
     # ------------------------------------------------------------------
-    builder.add_conditional_edges(
-        "decision_gate_node",
-        route_to_audit,
-        {
-            "decision_gate_node": "decision_gate_node",  # more findings pending
-            "audit_node":         "audit_node",
-        }
-    )
+    builder.add_conditional_edges("decision_gate_node", route_to_audit)
 
     # ------------------------------------------------------------------
     # auto_remediate_node → audit_node
