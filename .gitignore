@@ -6,3 +6,5 @@ __pycache__/
 venv/
 .env
 .DS_Store
+demo_requirements.txt.local-only
+install_attempt.log
