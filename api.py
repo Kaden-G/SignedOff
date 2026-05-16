@@ -18,14 +18,23 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
-from typing_extensions import Literal
+# Load .env BEFORE importing anything that might construct an Anthropic
+# client at import time. anthropic.AsyncAnthropic() reads ANTHROPIC_API_KEY
+# from the process environment on instantiation, not on import — but doing
+# this up front means every code path sees the same env regardless of
+# import order.
+from dotenv import load_dotenv
 
-from audit.verify_chain import verify_chain
-from graph import graph, make_config, resume_after_hitl
-from nodes.report_node import get_report
+load_dotenv()
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from pydantic import BaseModel, Field, field_validator  # noqa: E402
+from typing_extensions import Literal  # noqa: E402
+
+from audit.verify_chain import verify_chain  # noqa: E402
+from graph import graph, make_config, resume_after_hitl  # noqa: E402
+from nodes.report_node import get_report  # noqa: E402
 
 
 app = FastAPI(title="SignedOff Compliance Agent", version="1.0.0")
