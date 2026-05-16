@@ -1,0 +1,28 @@
+# SignedOff compliance agent — runtime dependencies.
+# demo_requirements.txt is a separate file used as test/demo input
+# fixture, NOT this project's own deps.
+
+# Async HTTP — used by CVENode to hit OSV.dev /v1/querybatch
+aiohttp>=3.9.0
+
+# Claude API — license reasoning (LicenseNode) and exec summary (RiskNode)
+anthropic>=0.34.0
+
+# Web framework + Pydantic models for the API layer
+fastapi>=0.110.0
+pydantic>=2.6.0
+uvicorn>=0.27.0
+
+# Graph runtime + checkpointer
+langgraph>=0.2.0
+
+# .env loading at api.py startup
+python-dotenv>=1.0.0
+
+# POLICY.yml parsing in InputNode
+PyYAML>=6.0
+
+# SBOMNode shells out to these CLI tools to resolve the dep tree and
+# fetch installed-package license metadata
+pipdeptree>=2.13.0
+pip-licenses>=4.4.0
