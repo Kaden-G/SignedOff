@@ -35,6 +35,8 @@ EXECUTIVE SUMMARY:
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -50,6 +52,7 @@ from agent_state import (
 
 
 LLM_MODEL = "claude-sonnet-4-6"
+CVE_CONTEXT_CONCURRENCY = 5
 
 SEVERITY_ORDER = ["none", "low", "medium", "high", "critical"]
 
@@ -92,11 +95,41 @@ def _severity_idx(level: Any) -> int:
         return SEVERITY_ORDER.index("medium")
 
 
-def _max_severity(findings: list[Finding]) -> RiskLevel:
+def _max_severity_of_findings(findings: list[Finding]) -> RiskLevel:
     if not findings:
         return RiskLevel.NONE
     best_idx = max(_severity_idx(f["severity"]) for f in findings)
     return RiskLevel(SEVERITY_ORDER[best_idx])
+
+
+def _max_severity(a: Any, b: Any) -> RiskLevel:
+    """Return the more severe of two RiskLevel-or-string values."""
+    idx_a = _severity_idx(a)
+    idx_b = _severity_idx(b)
+    return RiskLevel(SEVERITY_ORDER[max(idx_a, idx_b)])
+
+
+def _map_severity_string(value: str) -> RiskLevel:
+    """Map a lowercase severity string to RiskLevel; defaults to MEDIUM."""
+    try:
+        return RiskLevel(value.lower())
+    except (ValueError, AttributeError):
+        return RiskLevel.MEDIUM
+
+
+def _effective_severity(finding: Finding) -> Any:
+    """
+    For CVE findings, route on max(raw severity, contextualized_severity).
+    The LLM can never downgrade a CRITICAL past the human-review gate —
+    if EITHER raw or contextualized is HIGH/CRITICAL we always route to
+    HUMAN_REVIEW. License findings route on raw severity only.
+    """
+    finding_type = finding.get("finding_type", "")
+    raw = finding["severity"]
+    ctx = finding.get("contextualized_severity")
+    if finding_type.startswith("cve") and ctx is not None:
+        return _max_severity(raw, ctx)
+    return raw
 
 
 def route_finding(finding: Finding, policy: dict) -> DecisionStatus:
@@ -117,7 +150,7 @@ def route_finding(finding: Finding, policy: dict) -> DecisionStatus:
     thresholds_root = policy.get("thresholds") or DEFAULT_THRESHOLDS
     thresholds = thresholds_root.get(bucket) or DEFAULT_THRESHOLDS[bucket]
 
-    severity_idx = _severity_idx(finding["severity"])
+    severity_idx = _severity_idx(_effective_severity(finding))
     auto_remediate_idx = _severity_idx(
         thresholds.get("auto_remediate_below", DEFAULT_THRESHOLDS[bucket]["auto_remediate_below"])
     )
@@ -241,6 +274,261 @@ async def _call_llm_for_summary(summary_data: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# CVE use-case contextualization
+# ---------------------------------------------------------------------------
+
+CVE_USE_CASE_DESCRIPTIONS = {
+    "saas": (
+        "Software delivered as a service over the network. "
+        "Accepts user input via HTTP. Public-facing."
+    ),
+    "internal": (
+        "Internal tooling for employees only. Not exposed to the public "
+        "internet. Trusted users only."
+    ),
+    "distributed_binary": (
+        "Shipped to end users as an installable package. "
+        "Runs on user-controlled machines."
+    ),
+}
+
+
+async def _call_llm_for_cve_context(
+    vuln: dict,
+    package: str,
+    version: str,
+    raw_severity: str,
+    use_case: str,
+) -> Optional[dict]:
+    """
+    Ask Claude to contextualize a CVE against the declared use_case.
+
+    GROUNDING DISCIPLINE: the LLM receives the actual OSV record fields
+    needed to reason — id, summary, details, affected ranges, CWE ids,
+    references. It is explicitly instructed NOT to use any knowledge
+    outside that grounding data. Same pattern LicenseNode uses for
+    SPDX-grounded license reasoning.
+
+    Returns dict {"contextualized_severity", "rationale", ...} on
+    success, or None on any failure (defensive — the finding is left
+    unchanged).
+    """
+    try:
+        from anthropic import AsyncAnthropic
+        client = AsyncAnthropic()
+    except Exception:
+        return None
+
+    grounded_input = {
+        "id": vuln.get("id"),
+        "summary": vuln.get("summary"),
+        "details": (vuln.get("details") or "")[:1500],
+        "affected_packages": [
+            {
+                "name": (a.get("package") or {}).get("name"),
+                "ranges": a.get("ranges", []),
+            }
+            for a in (vuln.get("affected") or [])
+        ],
+        "cwe_ids": (vuln.get("database_specific") or {}).get("cwe_ids", []),
+        "references": [
+            r.get("url") for r in (vuln.get("references") or [])[:5]
+        ],
+    }
+    use_case_desc = CVE_USE_CASE_DESCRIPTIONS.get(use_case, "unspecified")
+
+    prompt = (
+        "You are a security analyst evaluating whether a CVE's risk is "
+        "materially different from its raw CVSS severity, given a specific "
+        "deployment context.\n\n"
+        f"Here is the CVE record:\n{json.dumps(grounded_input, indent=2)}\n\n"
+        f"The package is: {package} (version {version})\n"
+        f"The raw CVSS severity is: {raw_severity}\n"
+        f"The deployment use case is: {use_case} — {use_case_desc}\n\n"
+        "Based ONLY on the CVE record and the use case description above, answer:\n"
+        "1. Is the vulnerable code path likely to be reachable in this use case? "
+        "Be specific about which CVE attack vector would or would not apply.\n"
+        "2. What is the contextualized severity level for THIS deployment context? "
+        "Choose one: critical, high, medium, low, none\n"
+        "3. One-sentence rationale, plus a confidence level (high/medium/low).\n\n"
+        "Respond ONLY with JSON in this exact shape:\n"
+        "{\n"
+        '  "reachable": "yes|no|partial|unknown",\n'
+        '  "contextualized_severity": "critical|high|medium|low|none",\n'
+        '  "rationale": "One sentence. Confidence: high|medium|low.",\n'
+        '  "key_factor": "Most important factor in six words or fewer."\n'
+        "}\n\n"
+        "CRITICAL CONSTRAINTS:\n"
+        "- Do not reference any vulnerabilities, packages, or facts not present "
+        "in the CVE record above.\n"
+        "- Do not speculate about code paths the record does not describe.\n"
+        "- If the record is too thin to make a contextual judgment, return "
+        "contextualized_severity equal to the raw_severity and rationale "
+        '"Insufficient information to contextualize. Confidence: low."'
+    )
+
+    try:
+        response = await client.messages.create(
+            model=LLM_MODEL,
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw_text = response.content[0].text.strip()
+
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("```")[1]
+            if raw_text.startswith("json"):
+                raw_text = raw_text[4:]
+            raw_text = raw_text.strip()
+
+        result = json.loads(raw_text)
+        if not all(k in result for k in ("contextualized_severity", "rationale")):
+            return None
+        if result["contextualized_severity"] not in (
+            "critical", "high", "medium", "low", "none",
+        ):
+            return None
+        return result
+    except Exception:
+        return None
+
+
+def _hash_payload(data: dict) -> str:
+    serializable = {
+        k: (v.value if isinstance(v, CitationSource) else v)
+        for k, v in data.items()
+        if k != "content_hash"
+    }
+    return hashlib.sha256(
+        json.dumps(serializable, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _build_contextualization_citation(rationale: str) -> dict:
+    data: dict[str, Any] = {
+        "source": CitationSource.LLM_INFERENCE,
+        "url": None,
+        "identifier": None,
+        "excerpt": (rationale or "")[:100],
+        "retrieved_at": _now_iso(),
+        "confidence": "inferred",
+        "validated": False,
+        "validation_method": "not_validated",
+    }
+    data["content_hash"] = _hash_payload(data)
+    return data
+
+
+async def _contextualize_high_severity_cves(
+    findings: list[Finding],
+    use_case: str,
+    raw_osv_records: dict,
+) -> tuple[list[Finding], list[dict], dict]:
+    """
+    Contextualize HIGH/CRITICAL CVE findings against the declared
+    use_case via LLM. Mutates `findings` in place and returns:
+      (findings, audit_events_for_each_evaluation, summary_stats)
+
+    LOW/MEDIUM findings pass through untouched — policy auto-routes
+    them anyway so LLM tokens spent here would have no downstream impact.
+    License findings are never contextualized; LicenseNode already
+    grounds them on SPDX + use_case at creation time.
+
+    Defensive: on any LLM error the finding is returned unchanged. The
+    contextualization NEVER deletes or overwrites raw severity — it only
+    adds optional adjunct fields.
+    """
+    sem = asyncio.Semaphore(CVE_CONTEXT_CONCURRENCY)
+    audit_events: list[dict] = []
+    stats = {
+        "findings_evaluated": 0,
+        "downgraded_count": 0,
+        "unchanged_count": 0,
+        "escalated_count": 0,
+        "llm_call_failures": 0,
+    }
+
+    async def contextualize_one(finding: Finding) -> Finding:
+        finding_type = finding.get("finding_type", "")
+        if not finding_type.startswith("cve"):
+            return finding
+        sev_str = _severity_value(finding["severity"])
+        if sev_str not in ("high", "critical"):
+            return finding
+
+        raw_record = (raw_osv_records or {}).get(finding["finding_id"])
+        if not raw_record:
+            return finding
+
+        stats["findings_evaluated"] += 1
+        async with sem:
+            result = await _call_llm_for_cve_context(
+                vuln=raw_record,
+                package=finding["package"],
+                version=finding["version"],
+                raw_severity=sev_str,
+                use_case=use_case,
+            )
+
+        if result is None:
+            stats["llm_call_failures"] += 1
+            return finding
+
+        ctx_sev = _map_severity_string(result["contextualized_severity"])
+        finding["contextualized_severity"] = ctx_sev
+        finding["contextualization_rationale"] = result.get("rationale")
+
+        finding.setdefault("citations", []).append(
+            _build_contextualization_citation(result.get("rationale", ""))
+        )
+
+        raw_idx = _severity_idx(finding["severity"])
+        ctx_idx = _severity_idx(ctx_sev)
+        if ctx_idx < raw_idx:
+            stats["downgraded_count"] += 1
+        elif ctx_idx > raw_idx:
+            stats["escalated_count"] += 1
+        else:
+            stats["unchanged_count"] += 1
+
+        audit_events.append({
+            "timestamp": _now_iso(),
+            "event_type": "cve_contextualized",
+            "payload": {
+                "finding_id": finding["finding_id"],
+                "package": finding["package"],
+                "version": finding["version"],
+                "raw_severity": sev_str,
+                "contextualized_severity": _severity_value(ctx_sev),
+                "use_case": use_case,
+                "key_factor": result.get("key_factor"),
+            },
+        })
+
+        return finding
+
+    results = await asyncio.gather(
+        *(contextualize_one(f) for f in findings),
+        return_exceptions=True,
+    )
+
+    final: list[Finding] = []
+    for original, res in zip(findings, results):
+        if isinstance(res, Exception):
+            stats["llm_call_failures"] += 1
+            final.append(original)
+        else:
+            final.append(res)
+
+    audit_events.append({
+        "timestamp": _now_iso(),
+        "event_type": "cve_contextualization_complete",
+        "payload": dict(stats),
+    })
+    return final, audit_events, stats
+
+
+# ---------------------------------------------------------------------------
 # Audit events
 # ---------------------------------------------------------------------------
 
@@ -289,6 +577,7 @@ async def risk_node(state: AgentState) -> dict:
     use_case: str = state.get("use_case", "")
     policy: dict = state.get("policy") or {}
     policy_hash: str = policy.get("policy_hash") or "unknown"
+    raw_osv_records: dict = state.get("raw_osv_records") or {}
 
     errors: list[str] = []
 
@@ -298,7 +587,22 @@ async def risk_node(state: AgentState) -> dict:
     # deterministic UI ordering and reproducible tests.
     all_findings.sort(key=lambda f: -_severity_idx(f["severity"]))
 
-    # Stage 1: route every finding via policy thresholds.
+    # Stage 0: contextualize HIGH/CRITICAL CVE findings against use_case.
+    # LOW/MEDIUM and license findings pass through untouched. Mutates
+    # findings in place and appends LLM_INFERENCE citations + audit
+    # events. Defensive: failures leave findings unchanged.
+    try:
+        all_findings, context_events, _ctx_stats = await _contextualize_high_severity_cves(
+            all_findings, use_case, raw_osv_records,
+        )
+    except Exception as exc:
+        errors.append(f"CVE contextualization step crashed (continuing): {exc}")
+        context_events = []
+
+    # Stage 1: route every finding via policy thresholds. CVE routing
+    # uses max(raw severity, contextualized_severity) — see
+    # _effective_severity() — so the LLM can never downgrade a CRITICAL
+    # past the human-review gate.
     decided_at_iso = _now_iso()
     for f in all_findings:
         f["decision_status"] = route_finding(f, policy)
@@ -372,8 +676,8 @@ async def risk_node(state: AgentState) -> dict:
             if f["package"].lower() == pkg_name_lc
             and f["finding_type"].startswith("cve")
         ]
-        pkg["license_risk"] = _max_severity(pkg_license)
-        pkg["security_risk"] = _max_severity(pkg_cve)
+        pkg["license_risk"] = _max_severity_of_findings(pkg_license)
+        pkg["security_risk"] = _max_severity_of_findings(pkg_cve)
 
     # Stage 5: executive summary (grounded LLM, template fallback).
     summary_data = _build_summary_data(
@@ -395,7 +699,8 @@ async def risk_node(state: AgentState) -> dict:
         1 for f in all_findings if f["decision_status"] == DecisionStatus.ACCEPTED
     )
 
-    audit_events: list[dict] = [
+    audit_events: list[dict] = list(context_events)
+    audit_events.append(
         _risk_matrix_complete_event(
             total_findings=len(all_findings),
             human_review_count=len(pending_human_review),
@@ -403,7 +708,7 @@ async def risk_node(state: AgentState) -> dict:
             auto_accept_count=auto_accept_count,
             l2_hits=l2_hits,
         )
-    ]
+    )
     audit_events.extend(l2_auto_events)
 
     status = "awaiting_human" if pending_human_review else "running"

@@ -499,3 +499,36 @@ def test_finding_built_from_vector_only_vuln_has_correct_severity():
     f = result["cve_findings"][0]
     # Parsed CVSS 9.8 → CRITICAL
     assert f["severity"] == RiskLevel.CRITICAL
+
+
+# ---------------------------------------------------------------------------
+# raw_osv_records + Finding contextualization-field initialization
+# ---------------------------------------------------------------------------
+
+def test_cve_node_populates_raw_osv_records_keyed_by_finding_id():
+    """RiskNode needs raw OSV records to ground use-case contextualization."""
+    with patch("nodes.cve_node._query_osv_batch",
+               new=AsyncMock(return_value=_osv_response_with_django_vuln())):
+        result = _run(cve_node(_state()))
+
+    assert "raw_osv_records" in result
+    f = result["cve_findings"][0]
+    assert f["finding_id"] in result["raw_osv_records"]
+    assert result["raw_osv_records"][f["finding_id"]]["id"] == "GHSA-qm57-vhq3-3fwf"
+
+
+def test_cve_node_returns_empty_raw_osv_records_when_no_packages():
+    with patch("nodes.cve_node._query_osv_batch",
+               new=AsyncMock(return_value={"results": []})):
+        result = _run(cve_node(_state(packages=[])))
+    assert result["raw_osv_records"] == {}
+
+
+def test_findings_carry_contextualization_fields_initialized_to_none():
+    """CVENode initializes the two new Finding fields to None; RiskNode populates."""
+    with patch("nodes.cve_node._query_osv_batch",
+               new=AsyncMock(return_value=_osv_response_with_django_vuln())):
+        result = _run(cve_node(_state()))
+    f = result["cve_findings"][0]
+    assert f["contextualized_severity"] is None
+    assert f["contextualization_rationale"] is None

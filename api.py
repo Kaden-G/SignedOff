@@ -427,6 +427,28 @@ def _build_dependency_chains(raw_tree) -> dict[str, list[str]]:
     return chains
 
 
+def _pick_max_contextualized(findings: list[dict]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Across findings for a package, return (severity, rationale) for the
+    contextualized CVE finding with the highest contextualized severity.
+    Returns (None, None) if no CVE finding was contextualized.
+    """
+    best_idx = -1
+    best_sev: Optional[str] = None
+    best_rationale: Optional[str] = None
+    for f in findings:
+        ctx = f.get("contextualized_severity")
+        if ctx is None:
+            continue
+        sev_str = _enum_or_str(ctx)
+        idx = SEVERITY_ORDER.get(sev_str, -1)
+        if idx > best_idx:
+            best_idx = idx
+            best_sev = sev_str
+            best_rationale = f.get("contextualization_rationale")
+    return best_sev, best_rationale
+
+
 def _build_grouped_view(report: dict) -> dict:
     packages = report.get("packages") or []
     all_findings = (report.get("license_findings") or []) + (report.get("cve_findings") or [])
@@ -443,6 +465,7 @@ def _build_grouped_view(report: dict) -> dict:
         pkg_findings = findings_by_pkg.get(key, [])
         license_risk = _enum_or_str(pkg.get("license_risk"), "none")
         security_risk = _enum_or_str(pkg.get("security_risk"), "none")
+        ctx_sev, ctx_rationale = _pick_max_contextualized(pkg_findings)
         rows.append({
             "package": pkg["name"],
             "version": pkg["version"],
@@ -456,6 +479,8 @@ def _build_grouped_view(report: dict) -> dict:
             "action_label": _derive_action_label(pkg_findings, license_risk, security_risk),
             "has_fix_available": any(_has_fix(f) for f in pkg_findings),
             "dependency_chain": chains.get(pkg["name"].lower(), []),
+            "contextualized_severity": ctx_sev,
+            "contextualization_rationale": ctx_rationale,
         })
 
     rows.sort(key=lambda r: (
@@ -491,6 +516,8 @@ def _build_flat_view(report: dict) -> dict:
                 break
         citations = f.get("citations") or []
         primary_source = _enum_or_str(citations[0].get("source")) if citations else None
+        ctx = f.get("contextualized_severity")
+        ctx_sev_str = _enum_or_str(ctx) if ctx is not None else None
         findings_list.append({
             "finding_id": f["finding_id"],
             "package": f["package"],
@@ -506,6 +533,8 @@ def _build_flat_view(report: dict) -> dict:
             "fix_version": fix_version,
             "citation_count": len(citations),
             "primary_citation_source": primary_source,
+            "contextualized_severity": ctx_sev_str,
+            "contextualization_rationale": f.get("contextualization_rationale"),
         })
 
     findings_list.sort(key=lambda f: (

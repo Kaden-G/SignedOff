@@ -344,3 +344,152 @@ def test_audit_event_payload_counts_match_decisions():
     assert event["payload"]["human_review_count"] == 2
     assert event["payload"]["auto_remediate_count"] == 0
     assert event["payload"]["auto_accept_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# CVE use-case contextualization
+# ---------------------------------------------------------------------------
+
+def _ctx_state(findings, use_case="internal"):
+    """State for contextualization tests with raw_osv_records populated."""
+    osv_records = {
+        f["finding_id"]: {
+            "id": "GHSA-fake",
+            "summary": "Fake vuln summary.",
+            "details": "Long markdown details.",
+            "affected": [{"package": {"name": f["package"]}}],
+            "references": [],
+            "database_specific": {"cwe_ids": []},
+        }
+        for f in findings
+    }
+    state = _state(cve_findings=findings, use_case=use_case)
+    state["raw_osv_records"] = osv_records
+    return state
+
+
+def _ctx_llm_returning(severity_str, rationale="Contextual rationale. Confidence: high.",
+                      key_factor="No public input vector"):
+    """Build an AsyncMock for _call_llm_for_cve_context."""
+    return AsyncMock(return_value={
+        "reachable": "no",
+        "contextualized_severity": severity_str,
+        "rationale": rationale,
+        "key_factor": key_factor,
+    })
+
+
+def test_high_cve_finding_gets_contextualized_low_cve_does_not():
+    high_f = _finding(RiskLevel.HIGH, finding_type="cve")
+    low_f = _finding(RiskLevel.LOW, finding_type="cve", package="other", version="1.0")
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=_ctx_llm_returning("low"),
+    ) as llm_mock:
+        _run(risk_node(_ctx_state([high_f, low_f])))
+
+    # Only the HIGH finding should have triggered the LLM call.
+    assert llm_mock.call_count == 1
+    assert high_f.get("contextualized_severity") == RiskLevel.LOW
+    assert low_f.get("contextualized_severity") is None
+
+
+def test_license_finding_is_never_contextualized():
+    lic_f = _finding(
+        RiskLevel.CRITICAL,
+        finding_type="license_violation",
+        citations=[_citation(CitationSource.SPDX)],
+    )
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=_ctx_llm_returning("low"),
+    ) as llm_mock:
+        _run(risk_node(_ctx_state([lic_f])))
+    assert llm_mock.call_count == 0
+    assert lic_f.get("contextualized_severity") is None
+
+
+def test_contextualization_populates_rationale_and_appends_llm_citation():
+    f = _finding(RiskLevel.CRITICAL, finding_type="cve")
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=_ctx_llm_returning("medium", rationale="Use case mitigates this. Confidence: high."),
+    ):
+        _run(risk_node(_ctx_state([f])))
+
+    assert f["contextualized_severity"] == RiskLevel.MEDIUM
+    assert "Use case mitigates" in (f["contextualization_rationale"] or "")
+    # The LLM_INFERENCE citation should be appended to the original OSV citation.
+    sources = [c["source"] for c in f["citations"]]
+    assert CitationSource.LLM_INFERENCE in sources
+    llm_cit = next(c for c in f["citations"] if c["source"] == CitationSource.LLM_INFERENCE)
+    assert llm_cit["confidence"] == "inferred"
+    assert llm_cit["validated"] is False
+    assert len(llm_cit["content_hash"]) == 64
+
+
+def test_routing_uses_max_critical_raw_plus_low_ctx_still_human_review():
+    """The LLM cannot downgrade a CRITICAL past the human-review gate."""
+    f = _finding(RiskLevel.CRITICAL, finding_type="cve")
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=_ctx_llm_returning("low", rationale="Likely unreachable. Confidence: low."),
+    ):
+        result = _run(risk_node(_ctx_state([f])))
+
+    assert f["contextualized_severity"] == RiskLevel.LOW
+    assert f["decision_status"] == DecisionStatus.HUMAN_REVIEW
+    assert result["pending_human_review"] == [f]
+
+
+def test_routing_uses_max_high_raw_plus_critical_ctx_routes_to_human_review():
+    f = _finding(RiskLevel.HIGH, finding_type="cve")
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=_ctx_llm_returning("critical"),
+    ):
+        result = _run(risk_node(_ctx_state([f])))
+    assert f["contextualized_severity"] == RiskLevel.CRITICAL
+    assert f["decision_status"] == DecisionStatus.HUMAN_REVIEW
+    assert len(result["pending_human_review"]) == 1
+
+
+def test_llm_failure_leaves_finding_unchanged_no_crash():
+    f = _finding(RiskLevel.CRITICAL, finding_type="cve")
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=AsyncMock(return_value=None),
+    ):
+        result = _run(risk_node(_ctx_state([f])))
+
+    assert f.get("contextualized_severity") is None
+    assert f.get("contextualization_rationale") is None
+    assert f["decision_status"] == DecisionStatus.HUMAN_REVIEW
+    assert all(c["source"] != CitationSource.LLM_INFERENCE for c in f["citations"])
+    summary = next(
+        e for e in result["audit_events"]
+        if e["event_type"] == "cve_contextualization_complete"
+    )
+    assert summary["payload"]["llm_call_failures"] >= 1
+
+
+def test_audit_events_include_cve_contextualized_per_finding():
+    f1 = _finding(RiskLevel.HIGH, finding_type="cve", package="a", version="1")
+    f2 = _finding(RiskLevel.CRITICAL, finding_type="cve", package="b", version="2")
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=_ctx_llm_returning("medium"),
+    ):
+        result = _run(risk_node(_ctx_state([f1, f2])))
+
+    ctx_events = [
+        e for e in result["audit_events"] if e["event_type"] == "cve_contextualized"
+    ]
+    assert len(ctx_events) == 2
+    summary = next(
+        e for e in result["audit_events"]
+        if e["event_type"] == "cve_contextualization_complete"
+    )
+    assert summary["payload"]["findings_evaluated"] == 2
+    # Both went from high/critical → medium → downgraded.
+    assert summary["payload"]["downgraded_count"] == 2

@@ -646,6 +646,23 @@ class Finding(TypedDict):
     # This is a key UX differentiator — enterprise compliance teams
     # hate re-litigating decisions they already made.
 
+    contextualized_severity: Optional[RiskLevel]
+    # Set by RiskNode for HIGH/CRITICAL CVE findings only. The LLM
+    # evaluates whether the raw CVSS severity is materially different
+    # given the user's declared use_case (e.g. a Pillow image-processing
+    # CVE in an internal admin tool with no image upload is LOW actual
+    # risk even if raw CVSS is CRITICAL).
+    # None for findings that weren't contextualized (LOW/MEDIUM CVEs,
+    # license findings, or when contextualization fails defensively).
+    # Routing uses max(severity, contextualized_severity) — the LLM
+    # can never downgrade a CRITICAL past the human-review gate.
+
+    contextualization_rationale: Optional[str]
+    # One-to-two sentence rationale generated alongside
+    # contextualized_severity. Format: "{LLM analysis}. Confidence:
+    # {high|medium|low}. Reviewer should verify."
+    # None when contextualization didn't run.
+
 
 # ---------------------------------------------------------------------------
 # Primary State Schema
@@ -746,6 +763,14 @@ class AgentState(TypedDict):
     # All CVE/vulnerability findings produced by CVENode.
     # One Finding per CVE per package (a package with 3 CVEs = 3 Findings).
     # This granularity allows independent decisions per CVE.
+
+    raw_osv_records: dict
+    # Map of finding_id -> raw OSV vulnerability record. Populated by
+    # CVENode alongside cve_findings; consumed by RiskNode to ground
+    # the use-case contextualization LLM prompts. Kept in state rather
+    # than on each Finding to keep the Finding shape lean and avoid
+    # serializing the full OSV blob in API responses. Internal-only;
+    # never surfaced through the user-facing API.
 
     # -----------------------------------------------------------------------
     # Risk Layer

@@ -394,6 +394,10 @@ def _build_cve_finding(
         "decided_at": None,
         "decided_by": None,
         "prior_decision": None,
+        # Populated by RiskNode for HIGH/CRITICAL CVE findings only.
+        # See Finding TypedDict docs in agent_state.py.
+        "contextualized_severity": None,
+        "contextualization_rationale": None,
     }
     return finding  # type: ignore[return-value]
 
@@ -519,6 +523,7 @@ async def cve_node(state: AgentState) -> dict:
     if not packages:
         return {
             "cve_findings": [],
+            "raw_osv_records": {},
             "audit_events": [_cve_scan_complete_event(0, 0, 0, 0, 0)],
             "errors": [],
         }
@@ -574,6 +579,7 @@ async def cve_node(state: AgentState) -> dict:
         vuln_details = {}
 
     findings: list[Finding] = []
+    raw_osv_records: dict[str, dict] = {}
     packages_with_cves = 0
     vulns_seen = 0
 
@@ -596,6 +602,10 @@ async def cve_node(state: AgentState) -> dict:
                     pkg, vuln, [citation], use_case, cvss_mapping
                 )
                 findings.append(finding)
+                # Stash the raw OSV record so RiskNode can ground its
+                # use-case contextualization LLM prompts on real data
+                # rather than asking the LLM to recall from training.
+                raw_osv_records[finding["finding_id"]] = vuln
             except Exception as exc:
                 errors.append(
                     f"failed to build finding for {pkg['name']}=={pkg['version']} "
@@ -607,6 +617,7 @@ async def cve_node(state: AgentState) -> dict:
 
     return {
         "cve_findings": findings,
+        "raw_osv_records": raw_osv_records,
         "audit_events": [
             _cve_scan_complete_event(
                 packages_scanned=len(packages),
