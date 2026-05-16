@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent_state import CitationSource, DecisionStatus, RiskLevel  # noqa: E402
+from agent_state import (  # noqa: E402
+    CitationSource,
+    DecisionStatus,
+    RemediationType,
+    RiskLevel,
+)
 from cache.l2_decision_memory import l2_memory  # noqa: E402
 from nodes.risk_node import (  # noqa: E402
     DEFAULT_PRIOR_DECISIONS,
@@ -368,14 +375,24 @@ def _ctx_state(findings, use_case="internal"):
     return state
 
 
-def _ctx_llm_returning(severity_str, rationale="Contextual rationale. Confidence: high.",
-                      key_factor="No public input vector"):
+def _ctx_llm_returning(
+    severity_str,
+    rationale="Contextual rationale. Confidence: high.",
+    key_factor="No public input vector",
+    recommended_action_type="version_bump",
+    contextualized_recommendation=(
+        "Upgrade to the patched version. The contextualization confirms "
+        "this CVE is directly reachable in the declared use case."
+    ),
+):
     """Build an AsyncMock for _call_llm_for_cve_context."""
     return AsyncMock(return_value={
         "reachable": "no",
         "contextualized_severity": severity_str,
         "rationale": rationale,
         "key_factor": key_factor,
+        "recommended_action_type": recommended_action_type,
+        "contextualized_recommendation": contextualized_recommendation,
     })
 
 
@@ -493,3 +510,241 @@ def test_audit_events_include_cve_contextualized_per_finding():
     assert summary["payload"]["findings_evaluated"] == 2
     # Both went from high/critical → medium → downgraded.
     assert summary["payload"]["downgraded_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Context-aware remediation: enum + new Remediation appended
+# ---------------------------------------------------------------------------
+
+def test_remediation_type_monitor_value_exists_and_is_string():
+    """The new MONITOR enum value must inherit from str and serialize as 'monitor'."""
+    assert RemediationType.MONITOR.value == "monitor"
+    assert isinstance(RemediationType.MONITOR, str)
+    # str-enum: comparing to bare strings works for JSON downstream
+    assert RemediationType.MONITOR == "monitor"
+
+
+def _osv_remediation(version: str = "4.2.14") -> dict:
+    """Stand-in for the OSV-derived version_bump remediation built by CVENode."""
+    return {
+        "type": RemediationType.VERSION_BUMP,
+        "description": f"Upgrade to {version}",
+        "target_package": None,
+        "target_version": version,
+        "confidence": "high",
+        "rationale": "Patched in OSV record.",
+        "tradeoffs": None,
+        "citations": [_citation(CitationSource.OSV)],
+    }
+
+
+def _find_ctx_remediation(finding: dict) -> dict:
+    """Pick the LLM_INFERENCE-cited remediation out of finding['remediations']."""
+    return next(
+        r for r in finding["remediations"]
+        if any(c["source"] == CitationSource.LLM_INFERENCE for c in r.get("citations", []))
+    )
+
+
+def test_ctx_remediation_version_bump_appended_with_own_llm_inference_citation():
+    f = _finding(RiskLevel.HIGH, finding_type="cve")
+    f["remediations"] = [_osv_remediation()]  # pre-existing OSV remediation
+
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=_ctx_llm_returning(
+            "high",
+            recommended_action_type="version_bump",
+            contextualized_recommendation=(
+                "Upgrade to a patched version. The vector is reachable here."
+            ),
+        ),
+    ):
+        _run(risk_node(_ctx_state([f])))
+
+    # Two remediations total: original OSV + new context-aware
+    assert len(f["remediations"]) == 2
+    ctx_rem = _find_ctx_remediation(f)
+    assert ctx_rem["type"] == RemediationType.VERSION_BUMP
+    assert ctx_rem["target_package"] is None
+    assert ctx_rem["target_version"] is None
+    assert ctx_rem["confidence"] == "low"
+    # The new remediation's citation list MUST contain its own LLM_INFERENCE
+    # citation — separate from the LLM_INFERENCE citation on the Finding.
+    assert len(ctx_rem["citations"]) == 1
+    cit = ctx_rem["citations"][0]
+    assert cit["source"] == CitationSource.LLM_INFERENCE
+    assert cit["url"] is None
+    assert cit["validated"] is False
+    assert len(cit["content_hash"]) == 64
+
+
+def test_ctx_remediation_accept_as_is_appended():
+    f = _finding(RiskLevel.HIGH, finding_type="cve")
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=_ctx_llm_returning(
+            "low",
+            recommended_action_type="accept_as_is",
+            contextualized_recommendation=(
+                "Accept this finding as low risk. The attack vector does not "
+                "reach this deployment model."
+            ),
+        ),
+    ):
+        _run(risk_node(_ctx_state([f])))
+
+    ctx_rem = _find_ctx_remediation(f)
+    assert ctx_rem["type"] == RemediationType.ACCEPT_AS_IS
+
+
+def test_ctx_remediation_monitor_appended():
+    f = _finding(RiskLevel.HIGH, finding_type="cve")
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=_ctx_llm_returning(
+            "medium",
+            recommended_action_type="monitor",
+            contextualized_recommendation=(
+                "Audit your codebase for the conditional code path. "
+                "If present, treat as version_bump priority."
+            ),
+        ),
+    ):
+        _run(risk_node(_ctx_state([f])))
+
+    ctx_rem = _find_ctx_remediation(f)
+    assert ctx_rem["type"] == RemediationType.MONITOR
+    # type is a str-enum, so json.dumps would emit "monitor" downstream
+    assert ctx_rem["type"].value == "monitor"
+
+
+def test_ctx_remediation_invalid_action_type_rejects_entire_result():
+    """
+    Defensive: if the LLM returns an action_type outside the four-value
+    vocabulary, _call_llm_for_cve_context returns None and the
+    contextualization is skipped entirely — no Remediation appended,
+    no contextualized_severity set, llm_call_failures bumped.
+    Validation lives in the REAL _call_llm_for_cve_context, so this
+    test exercises it by NOT mocking that function — instead it mocks
+    the anthropic client's create() to return the bad payload.
+    """
+    f = _finding(RiskLevel.HIGH, finding_type="cve")
+    f["remediations"] = [_osv_remediation()]
+
+    bad_payload = json.dumps({
+        "reachable": "yes",
+        "contextualized_severity": "high",
+        "rationale": "Looks reachable. Confidence: high.",
+        "key_factor": "x",
+        "recommended_action_type": "fix_it",  # not in the 4-value vocabulary
+        "contextualized_recommendation": "Do the thing that fixes everything.",
+    })
+    fake_response = SimpleNamespace(content=[SimpleNamespace(text=bad_payload)])
+    fake_client = SimpleNamespace(
+        messages=SimpleNamespace(create=AsyncMock(return_value=fake_response))
+    )
+    fake_anthropic_module = SimpleNamespace(AsyncAnthropic=lambda: fake_client)
+
+    with _patch_summary(), patch.dict(
+        sys.modules, {"anthropic": fake_anthropic_module}
+    ):
+        result = _run(risk_node(_ctx_state([f])))
+
+    # No new remediation appended — still only the OSV one.
+    assert len(f["remediations"]) == 1
+    assert f["remediations"][0]["target_version"] == "4.2.14"
+    assert f.get("contextualized_severity") is None
+    summary = next(
+        e for e in result["audit_events"]
+        if e["event_type"] == "cve_contextualization_complete"
+    )
+    assert summary["payload"]["llm_call_failures"] >= 1
+
+
+def test_ctx_remediation_empty_recommendation_rejects_result():
+    """An empty / too-short contextualized_recommendation also rejects."""
+    f = _finding(RiskLevel.HIGH, finding_type="cve")
+
+    bad_payload = json.dumps({
+        "reachable": "yes",
+        "contextualized_severity": "high",
+        "rationale": "ok. Confidence: low.",
+        "key_factor": "x",
+        "recommended_action_type": "version_bump",
+        "contextualized_recommendation": "",   # too short
+    })
+    fake_response = SimpleNamespace(content=[SimpleNamespace(text=bad_payload)])
+    fake_client = SimpleNamespace(
+        messages=SimpleNamespace(create=AsyncMock(return_value=fake_response))
+    )
+    fake_anthropic_module = SimpleNamespace(AsyncAnthropic=lambda: fake_client)
+
+    with _patch_summary(), patch.dict(
+        sys.modules, {"anthropic": fake_anthropic_module}
+    ):
+        _run(risk_node(_ctx_state([f])))
+
+    # No contextualization happened — no LLM_INFERENCE citation, no new remediation.
+    assert f["remediations"] == []
+    assert all(
+        c["source"] != CitationSource.LLM_INFERENCE for c in f["citations"]
+    )
+
+
+def test_ctx_remediation_preserves_existing_version_bump():
+    """We APPEND a new remediation alongside the OSV one — we don't replace."""
+    f = _finding(RiskLevel.HIGH, finding_type="cve")
+    osv_rem = _osv_remediation(version="4.2.14")
+    f["remediations"] = [osv_rem]
+
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=_ctx_llm_returning("medium", recommended_action_type="monitor"),
+    ):
+        _run(risk_node(_ctx_state([f])))
+
+    assert len(f["remediations"]) == 2
+    # Original OSV remediation is still present, unmodified, at index 0.
+    assert f["remediations"][0] is osv_rem
+    assert f["remediations"][0]["type"] == RemediationType.VERSION_BUMP
+    assert f["remediations"][0]["target_version"] == "4.2.14"
+    # Index 1 is the new context-aware one.
+    assert f["remediations"][1]["type"] == RemediationType.MONITOR
+
+
+def test_ctx_audit_summary_includes_action_type_distribution():
+    """cve_contextualization_complete now breaks down counts by action type."""
+    f1 = _finding(RiskLevel.HIGH, finding_type="cve", package="a", version="1")
+    f2 = _finding(RiskLevel.CRITICAL, finding_type="cve", package="b", version="2")
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=_ctx_llm_returning("medium", recommended_action_type="monitor"),
+    ):
+        result = _run(risk_node(_ctx_state([f1, f2])))
+
+    summary = next(
+        e for e in result["audit_events"]
+        if e["event_type"] == "cve_contextualization_complete"
+    )
+    dist = summary["payload"]["action_type_distribution"]
+    # All four vocabulary keys must be present (with zeros where unused).
+    assert set(dist.keys()) == {
+        "version_bump", "accept_as_is", "compensating_control", "monitor"
+    }
+    assert dist["monitor"] == 2
+    assert dist["version_bump"] == 0
+
+
+def test_ctx_per_finding_audit_event_includes_recommended_action_type():
+    f = _finding(RiskLevel.HIGH, finding_type="cve")
+    with _patch_summary(), patch(
+        "nodes.risk_node._call_llm_for_cve_context",
+        new=_ctx_llm_returning("high", recommended_action_type="compensating_control"),
+    ):
+        result = _run(risk_node(_ctx_state([f])))
+
+    ctx_event = next(
+        e for e in result["audit_events"] if e["event_type"] == "cve_contextualized"
+    )
+    assert ctx_event["payload"]["recommended_action_type"] == "compensating_control"

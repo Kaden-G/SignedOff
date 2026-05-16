@@ -164,6 +164,19 @@ class RemediationType(str, Enum):
                                vulnerable code path is unreachable).
                                Always requires explicit human acceptance
                                with rationale.
+        MONITOR              — Conditional or audit-required remediation.
+                               The CVE's reachability depends on
+                               application-specific code or runtime
+                               configuration that cannot be determined
+                               from the dependency tree alone. The
+                               reviewer should audit their codebase for
+                               the specific condition described in the
+                               contextualization rationale and decide
+                               whether to fix, accept, or defer based
+                               on what they find. Used by
+                               contextualization analysis when the
+                               attack vector requires conditions only
+                               the application owner can verify.
     """
     VERSION_BUMP = "version_bump"
     PACKAGE_SWAP = "package_swap"
@@ -171,6 +184,7 @@ class RemediationType(str, Enum):
     COMPENSATING_CONTROL = "compensating_control"
     NO_FIX_AVAILABLE = "no_fix_available"
     ACCEPT_AS_IS = "accept_as_is"
+    MONITOR = "monitor"
 
 
 class CitationSource(str, Enum):
