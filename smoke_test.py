@@ -25,6 +25,13 @@ directly. Packages that fail to install (e.g. mysqlclient on Mac without
 MySQL libs) will be missing from the scan. Documented in errors[].
 """
 
+# Load .env BEFORE importing anything that may construct an Anthropic
+# client at import time. Matches the pattern in api.py so ANTHROPIC_API_KEY
+# is picked up without a manual `export` step.
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import asyncio
 import base64
 import sys
