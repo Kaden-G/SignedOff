@@ -574,6 +574,19 @@ RESPONSE 200 OK — ?view=grouped:
           "contextualization_rationale": "Vulnerable code path requires a public image upload form, which this internal admin tool does not expose. Confidence: high.",
             # Rationale for the contextualized_severity above. Null when
             # no contextualization ran.
+          "dependency_chain": ["factory-boy", "faker"]
+            # The chain of parent packages that pulled this package into
+            # the dependency tree, root-first, excluding the package itself.
+            #   - []                              = direct dep (declared in
+            #                                       requirements.txt)
+            #   - ["factory-boy"]                 = 1 level transitive
+            #   - ["factory-boy", "faker"]        = 2 levels transitive
+            # Computed at API response time from raw_dependency_tree;
+            # NOT stored on the Finding. Lowercased lookup, so the
+            # `package` field in the row may be mixed-case (e.g. "Django")
+            # while the chain entries are lowercased.
+            # Drives "Why is this package in your tree?" UI affordance —
+            # critical for surfacing buried transitive vulnerabilities.
         },
         {
           "package": "mysqlclient",
@@ -639,10 +652,13 @@ RESPONSE 200 OK — ?view=flat:
             # Routing uses max(severity, contextualized_severity) — the
             # LLM-derived downgrade NEVER bypasses the human-review gate
             # when the raw severity is HIGH/CRITICAL.
-          "contextualization_rationale": "One-sentence LLM reasoning. Confidence: high."
+          "contextualization_rationale": "One-sentence LLM reasoning. Confidence: high.",
             # Companion to contextualized_severity. Null when no
             # contextualization ran. Backed by an LLM_INFERENCE citation
             # appended to the finding's citations list.
+          "dependency_chain": ["factory-boy", "faker"]
+            # Same shape and semantics as in the grouped view above —
+            # root-first list of parent packages, [] for direct deps.
         }
         # ... remaining findings
       ]
@@ -698,6 +714,10 @@ RESPONSE 200 OK:
             #     #   show_for_confirmation → show "Confirm previous" button
             #     #   auto_accept_with_log  → (never reaches this endpoint)
             # }
+          "dependency_chain": ["factory-boy", "faker"]
+            # Root-first list of parent packages that pulled this
+            # package in. [] for direct deps. Same shape as in the
+            # risk-matrix grouped/flat views. Lowercased entries.
         }
         # ... remaining pending findings
       ]

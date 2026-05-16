@@ -505,6 +505,7 @@ def _build_flat_view(report: dict) -> dict:
     transitive_lookup = {
         (p["name"], p["version"]): p.get("transitive", False) for p in packages
     }
+    chains = _build_dependency_chains(report.get("raw_dependency_tree") or {})
 
     findings_list: list[dict] = []
     for f in all_findings:
@@ -535,6 +536,7 @@ def _build_flat_view(report: dict) -> dict:
             "primary_citation_source": primary_source,
             "contextualized_severity": ctx_sev_str,
             "contextualization_rationale": f.get("contextualization_rationale"),
+            "dependency_chain": chains.get(f["package"].lower(), []),
         })
 
     findings_list.sort(key=lambda f: (
@@ -572,6 +574,7 @@ async def get_pending_review(job_id: str):
     pending = values.get("pending_human_review") or []
     policy = values.get("policy") or {}
     prior_decisions_cfg = policy.get("prior_decisions") or {}
+    chains = _build_dependency_chains(values.get("raw_dependency_tree") or {})
 
     enhanced: list[dict] = []
     for f in pending:
@@ -584,6 +587,7 @@ async def get_pending_review(job_id: str):
                 prior_with_mode = dict(prior)
                 prior_with_mode["l2_mode"] = mode
                 f_copy["prior_decision"] = prior_with_mode
+        f_copy["dependency_chain"] = chains.get(f_copy["package"].lower(), [])
         enhanced.append(f_copy)
 
     return {

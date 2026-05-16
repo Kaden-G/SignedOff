@@ -581,6 +581,132 @@ def test_risk_matrix_grouped_chain_defaults_to_empty_for_unknown_package(client)
 
 
 # ---------------------------------------------------------------------------
+# Risk matrix — dependency_chain on flat view + pending-review
+# ---------------------------------------------------------------------------
+
+def _seed_completed_report_with_findings_and_tree(job_id: str = "job-flat-chain"):
+    """Seeds a report with CVE findings on packages that have known chain
+    positions. Used to assert dependency_chain on flat view rows."""
+    from nodes.report_node import _reports
+    _seed_job(job_id, use_case="saas")
+    _reports[job_id] = {
+        "job_id": job_id,
+        "use_case": "saas",
+        "scanned_at": "2026-05-15T10:00:00Z",
+        "completed_at": "2026-05-15T10:00:31Z",
+        "summary": {},
+        "packages": [
+            {"name": "django", "version": "4.2.3", "transitive": False,
+             "from_cache": False, "license": "BSD-3-Clause",
+             "license_status": "compliant",
+             "license_risk": RiskLevel.NONE, "security_risk": RiskLevel.CRITICAL,
+             "cves": [], "cached_at": None},
+            {"name": "text-unidecode", "version": "1.3", "transitive": True,
+             "from_cache": False, "license": "Artistic-1.0",
+             "license_status": "restricted",
+             "license_risk": RiskLevel.MEDIUM, "security_risk": RiskLevel.NONE,
+             "cves": [], "cached_at": None},
+        ],
+        "cve_findings": [{
+            "finding_id": "f-cve-django",
+            "package": "django",
+            "version": "4.2.3",
+            "finding_type": "cve",
+            "severity": RiskLevel.CRITICAL,
+            "description": "SQL injection",
+            "recommendation": "Upgrade",
+            "decision_status": DecisionStatus.HUMAN_REVIEW,
+            "remediations": [],
+            "citations": [{"source": "osv", "url": "https://osv.dev/x",
+                           "identifier": "GHSA-x", "excerpt": "x",
+                           "retrieved_at": "x", "confidence": "x",
+                           "validated": True, "validation_method": "x",
+                           "content_hash": "x"}],
+        }],
+        "license_findings": [{
+            "finding_id": "f-lic-textunidecode",
+            "package": "text-unidecode",
+            "version": "1.3",
+            "finding_type": "license_restricted",
+            "severity": RiskLevel.MEDIUM,
+            "description": "Artistic-1.0 detected",
+            "recommendation": "Review",
+            "decision_status": DecisionStatus.HUMAN_REVIEW,
+            "remediations": [],
+            "citations": [{"source": "spdx", "url": "https://spdx.org/Artistic-1.0",
+                           "identifier": "Artistic-1.0", "excerpt": "x",
+                           "retrieved_at": "x", "confidence": "x",
+                           "validated": True, "validation_method": "x",
+                           "content_hash": "x"}],
+        }],
+        "raw_dependency_tree": {"tree": _sample_tree()},
+        "audit_trail_entry_count": 1,
+        "chain_valid": True,
+        "executive_summary": "stub",
+    }
+
+
+def test_risk_matrix_flat_includes_dependency_chain_field(client):
+    _seed_completed_report_with_findings_and_tree()
+    with _patch_graph():
+        resp = client.get("/scan/risk-matrix/job-flat-chain?view=flat")
+    assert resp.status_code == 200
+    findings = {f["finding_id"]: f for f in resp.json()["findings"]}
+    # Direct dep (django) → empty chain
+    assert findings["f-cve-django"]["dependency_chain"] == []
+    # Two-level transitive (text-unidecode pulled in by factory-boy → faker)
+    assert findings["f-lic-textunidecode"]["dependency_chain"] == [
+        "factory-boy", "faker"
+    ]
+
+
+def test_pending_review_includes_dependency_chain_on_each_finding(client):
+    _seed_job("job-pending-chain", use_case="saas")
+    pending_findings = [
+        {
+            "finding_id": "f-cve-django",
+            "package": "django",
+            "version": "4.2.3",
+            "finding_type": "cve",
+            "severity": RiskLevel.CRITICAL,
+            "use_case": "saas",
+            "decision_status": DecisionStatus.HUMAN_REVIEW,
+            "remediations": [],
+            "citations": [],
+            "description": "x", "recommendation": "x",
+            "prior_decision": None,
+        },
+        {
+            "finding_id": "f-lic-textunidecode",
+            "package": "text-unidecode",
+            "version": "1.3",
+            "finding_type": "license_restricted",
+            "severity": RiskLevel.MEDIUM,
+            "use_case": "saas",
+            "decision_status": DecisionStatus.HUMAN_REVIEW,
+            "remediations": [],
+            "citations": [],
+            "description": "x", "recommendation": "x",
+            "prior_decision": None,
+        },
+    ]
+    state_values = {
+        "use_case": "saas",
+        "pending_human_review": pending_findings,
+        "policy": {},
+        "raw_dependency_tree": {"tree": _sample_tree()},
+    }
+    with _patch_graph(values=state_values):
+        resp = client.get("/scan/pending-review/job-pending-chain")
+    assert resp.status_code == 200
+    findings = {f["finding_id"]: f for f in resp.json()["findings"]}
+    assert findings["f-cve-django"]["dependency_chain"] == []
+    assert findings["f-lic-textunidecode"]["dependency_chain"] == [
+        "factory-boy", "faker"
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Static dashboard mount
 # ---------------------------------------------------------------------------
 
