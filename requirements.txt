@@ -5,6 +5,10 @@
 # Async HTTP — used by CVENode to hit OSV.dev /v1/querybatch
 aiohttp>=3.9.0
 
+# CVSS vector parser — CVENode reads severity[].score strings like
+# "CVSS:3.1/AV:N/AC:L/..." and converts them to numeric base scores
+cvss>=3.0
+
 # Claude API — license reasoning (LicenseNode) and exec summary (RiskNode)
 anthropic>=0.34.0
 

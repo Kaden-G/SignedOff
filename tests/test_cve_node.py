@@ -13,11 +13,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from agent_state import CitationSource, DecisionStatus, RiskLevel  # noqa: E402
 from nodes.cve_node import (  # noqa: E402
+    _parse_cvss_vector,
     build_none_found_citation,
     build_osv_citation,
     cve_node,
     cvss_to_risk_level,
     extract_cvss_score,
+    extract_vuln_summary,
 )
 
 
@@ -174,17 +176,24 @@ def test_cvss_mapping_overridable_via_policy():
     assert cvss_to_risk_level(1.9, policy_mapping) == RiskLevel.LOW
 
 
-def test_extract_cvss_score_prefers_v3_then_database_specific():
-    # Numeric string in CVSS_V3 entry
+def test_extract_cvss_score_priority_chain():
+    # Priority 2: numeric string in severity[].score is parsed as a number.
     assert extract_cvss_score(
         {"severity": [{"type": "CVSS_V3", "score": "7.5"}]}
     ) == 7.5
 
-    # CVSS vector string falls through to database_specific.cvss.score
+    # Priority 2: complete CVSS vector string is parsed to its base score.
+    score = extract_cvss_score({
+        "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
+    })
+    assert score is not None and 9.7 <= score <= 9.9  # canonical 9.8
+
+    # Priority 1: numeric in affected[].database_specific.cvss.score wins
+    # over a CVSS vector in severity[].
     assert extract_cvss_score({
-        "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L"}],
-        "database_specific": {"cvss": {"score": 9.1}},
-    }) == 9.1
+        "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
+        "affected": [{"database_specific": {"cvss": {"score": 4.4}}}],
+    }) == 4.4
 
     # No score at all → None
     assert extract_cvss_score({}) is None
@@ -255,3 +264,238 @@ def test_osv_citation_url_comes_from_response_not_llm():
 def test_build_osv_citation_uses_provided_retrieved_at():
     cit = build_osv_citation(VULN_DJANGO, "2026-05-13T14:32:08Z")
     assert cit["retrieved_at"] == "2026-05-13T14:32:08Z"
+
+
+# ---------------------------------------------------------------------------
+# Real-shape OSV fixtures (taken from actual osv.dev responses)
+# ---------------------------------------------------------------------------
+
+# Shape observed for urllib3 1.26.x (GHSA-2xpw-w6gg-jr37, real osv.dev record).
+# Score lives BOTH in severity[].score as a CVSS vector AND in
+# affected[].database_specific.cvss.score as a number.
+OSV_URLLIB3_REAL_SHAPE = {
+    "id": "GHSA-2xpw-w6gg-jr37",
+    "summary": "urllib3's Proxy-Authorization request header isn't stripped during cross-origin redirects",
+    "details": (
+        "### Impact\n\nurllib3 doesn't treat the `Proxy-Authorization` header as one that "
+        "should be stripped...\n\n### Affected versions\n\n- urllib3 < 1.26.19"
+    ),
+    "severity": [
+        {"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N"},
+    ],
+    "affected": [
+        {
+            "package": {"name": "urllib3", "ecosystem": "PyPI"},
+            "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "1.26.19"}]}],
+            "database_specific": {"cvss": {"score": 4.4, "severity": "MEDIUM"}},
+        }
+    ],
+    "database_specific": {"cwe_ids": ["CWE-200"], "severity": "MODERATE"},
+}
+
+# Shape with ONLY the CVSS vector string (no numeric in database_specific).
+OSV_VECTOR_ONLY_SHAPE = {
+    "id": "GHSA-test-vector-only",
+    "summary": "Test vuln with only vector score.",
+    "severity": [
+        {"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"},
+    ],
+    "affected": [{"package": {"name": "x", "ecosystem": "PyPI"}, "ranges": []}],
+}
+
+# Shape with no severity[] and no numeric — only the string label fallback.
+OSV_LABEL_ONLY_SHAPE = {
+    "id": "GHSA-test-label-only",
+    "summary": "Test vuln with only severity label.",
+    "affected": [{"package": {"name": "x", "ecosystem": "PyPI"}, "ranges": []}],
+    "database_specific": {"severity": "HIGH"},
+}
+
+# Shape with summary empty but long markdown details.
+OSV_DETAILS_FALLBACK_SHAPE = {
+    "id": "GHSA-test-details",
+    "summary": "",
+    "details": (
+        "### Summary\n\n"
+        "The `requests` library does not enforce strict timeouts on streaming downloads, "
+        "allowing slow-loris style attacks.\n\n"
+        "### Mitigation\n\nApply patch in 2.31.0."
+    ),
+    "severity": [{"type": "CVSS_V3", "score": "5.0"}],
+    "affected": [{"package": {"name": "requests", "ecosystem": "PyPI"}, "ranges": []}],
+}
+
+
+# ---------------------------------------------------------------------------
+# Bug 1: CVSS score extraction
+# ---------------------------------------------------------------------------
+
+def test_cvss_score_from_affected_database_specific_takes_priority():
+    # Priority 1: numeric in affected[].database_specific.cvss.score wins
+    # even when severity[].score has a CVSS vector.
+    assert extract_cvss_score(OSV_URLLIB3_REAL_SHAPE) == 4.4
+
+
+def test_cvss_score_parses_v31_vector_string():
+    # Priority 2: no numeric available, parse the vector. The well-known
+    # 9.8 critical vector should round-trip to 9.8.
+    score = extract_cvss_score(OSV_VECTOR_ONLY_SHAPE)
+    assert score is not None
+    assert 9.7 <= score <= 9.9  # spec-compliant 9.8 ± rounding tolerance
+
+
+def test_cvss_score_parses_v40_vector_string():
+    vuln = {
+        "id": "GHSA-test-cvss4",
+        "summary": "test",
+        "severity": [{
+            "type": "CVSS_V4",
+            "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+        }],
+        "affected": [{"package": {"name": "x", "ecosystem": "PyPI"}, "ranges": []}],
+    }
+    score = extract_cvss_score(vuln)
+    # CVSS v4 — requires the `cvss` library to parse. Skip cleanly if missing.
+    try:
+        import cvss  # noqa: F401
+    except ImportError:
+        assert score is None
+        return
+    assert score is not None
+    assert 9.0 <= score <= 9.5
+
+
+def test_cvss_score_falls_back_to_database_specific_severity_label():
+    assert extract_cvss_score(OSV_LABEL_ONLY_SHAPE) == 7.5  # HIGH anchor
+
+
+def test_cvss_score_label_fallback_handles_moderate_and_low():
+    vuln_mod = {"id": "x", "affected": [], "database_specific": {"severity": "MODERATE"}}
+    vuln_low = {"id": "x", "affected": [], "database_specific": {"severity": "LOW"}}
+    assert extract_cvss_score(vuln_mod) == 5.5
+    assert extract_cvss_score(vuln_low) == 3.0
+
+
+def test_cvss_score_returns_none_when_nothing_extractable():
+    vuln = {"id": "x", "summary": "test", "affected": [], "database_specific": {}}
+    assert extract_cvss_score(vuln) is None
+
+
+def test_cvss_vector_parser_directly_round_trips_critical():
+    # The canonical 9.8 critical RCE vector.
+    score = _parse_cvss_vector("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+    assert score is not None
+    assert 9.7 <= score <= 9.9
+
+
+def test_cvss_vector_parser_rejects_garbage():
+    assert _parse_cvss_vector("not a vector") is None
+    assert _parse_cvss_vector("") is None
+    assert _parse_cvss_vector(None) is None  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Bug 2: summary extraction
+# ---------------------------------------------------------------------------
+
+def test_summary_extraction_prefers_summary_over_details():
+    summary = extract_vuln_summary(OSV_URLLIB3_REAL_SHAPE)
+    assert summary.startswith("urllib3's Proxy-Authorization")
+    # Truncated to 200 by default
+    assert len(summary) <= 200
+
+
+def test_summary_extraction_falls_back_to_details_when_summary_empty():
+    summary = extract_vuln_summary(OSV_DETAILS_FALLBACK_SHAPE)
+    # Markdown headers stripped, first paragraph extracted
+    assert "#" not in summary
+    assert "requests" in summary.lower()
+    assert "library does not enforce" in summary
+
+
+def test_summary_extraction_returns_explicit_marker_when_nothing_available():
+    vuln = {"id": "GHSA-empty"}
+    summary = extract_vuln_summary(vuln)
+    assert "GHSA-empty" in summary
+    assert "No summary" in summary
+
+
+def test_finding_description_contains_real_text_not_placeholder():
+    # Full integration: a real-shape vuln yields a readable description.
+    pkg = _pkg(name="urllib3", version="1.26.18")
+    response = {"results": [{"vulns": [OSV_URLLIB3_REAL_SHAPE]}]}
+    with patch(
+        "nodes.cve_node._query_osv_batch", new=AsyncMock(return_value=response)
+    ):
+        result = _run(cve_node(_state(packages=[pkg])))
+
+    assert len(result["cve_findings"]) == 1
+    f = result["cve_findings"][0]
+    assert "No summary" not in f["description"]
+    assert "GHSA-2xpw-w6gg-jr37" in f["description"]
+    assert "Proxy-Authorization" in f["description"]
+    # Severity comes from priority-1 path (4.4 → MEDIUM)
+    assert f["severity"] == RiskLevel.MEDIUM
+    # Citation excerpt also has real text, bounded at 100
+    cit = f["citations"][0]
+    assert cit["excerpt"].startswith("urllib3's")
+    assert len(cit["excerpt"]) <= 100
+
+
+def test_batch_returns_only_id_stubs_enrichment_provides_full_records():
+    """
+    Real OSV /v1/querybatch returns only {"id": ...} per vuln — no
+    severity, no summary, no affected. The enrichment step fetches the
+    full record from /v1/vulns/{id}. When enriched data is present,
+    findings must use it (not fall back to the stub's empty fields).
+    """
+    pkg = _pkg(name="urllib3", version="1.26.18")
+    stub_response = {"results": [{"vulns": [{"id": "GHSA-2xpw-w6gg-jr37"}]}]}
+    enriched = {"GHSA-2xpw-w6gg-jr37": OSV_URLLIB3_REAL_SHAPE}
+
+    with patch(
+        "nodes.cve_node._query_osv_batch", new=AsyncMock(return_value=stub_response)
+    ), patch(
+        "nodes.cve_node._enrich_vulns", new=AsyncMock(return_value=enriched)
+    ):
+        result = _run(cve_node(_state(packages=[pkg])))
+
+    assert len(result["cve_findings"]) == 1
+    f = result["cve_findings"][0]
+    # Enrichment data drove BOTH the severity (4.4 → MEDIUM) and the
+    # readable description (real summary, not "No summary available").
+    assert f["severity"] == RiskLevel.MEDIUM
+    assert "Proxy-Authorization" in f["description"]
+    assert "No summary" not in f["description"]
+
+
+def test_enrichment_failure_does_not_break_scan():
+    """When the per-vuln fetch fails entirely, the scan continues with
+    whatever stub data the batch returned."""
+    pkg = _pkg(name="urllib3", version="1.26.18")
+    stub_response = {"results": [{"vulns": [{"id": "GHSA-x"}]}]}
+
+    async def boom(_ids):
+        raise RuntimeError("OSV down")
+
+    with patch(
+        "nodes.cve_node._query_osv_batch", new=AsyncMock(return_value=stub_response)
+    ), patch("nodes.cve_node._enrich_vulns", side_effect=boom):
+        result = _run(cve_node(_state(packages=[pkg])))
+
+    # Still produced a finding from the stub; logged the enrichment failure.
+    assert len(result["cve_findings"]) == 1
+    assert any("enrichment failed" in e for e in result["errors"])
+
+
+def test_finding_built_from_vector_only_vuln_has_correct_severity():
+    pkg = _pkg(name="x", version="1.0")
+    response = {"results": [{"vulns": [OSV_VECTOR_ONLY_SHAPE]}]}
+    with patch(
+        "nodes.cve_node._query_osv_batch", new=AsyncMock(return_value=response)
+    ):
+        result = _run(cve_node(_state(packages=[pkg])))
+
+    f = result["cve_findings"][0]
+    # Parsed CVSS 9.8 → CRITICAL
+    assert f["severity"] == RiskLevel.CRITICAL

@@ -22,6 +22,7 @@ ERROR PHILOSOPHY:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
@@ -43,7 +44,9 @@ from agent_state import (
 
 
 OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
+OSV_VULN_URL = "https://api.osv.dev/v1/vulns/{vuln_id}"
 OSV_TIMEOUT_SECONDS = 30
+OSV_ENRICH_CONCURRENCY = 10
 
 DEFAULT_CVSS_THRESHOLDS = {
     "critical_threshold": 9.0,
@@ -74,6 +77,40 @@ def _hash_citation(data: dict) -> str:
     ).hexdigest()
 
 
+def extract_vuln_summary(vuln: dict, max_len: int = 200) -> str:
+    """
+    Pull a human-readable summary out of an OSV record.
+
+    Priority:
+      1. vuln["summary"]           — short headline, usually one line
+      2. vuln["details"]           — long markdown body; strip formatting
+                                     and take the first paragraph
+      3. explicit fallback string  — surfaces the missing data instead of
+                                     pretending nothing was wrong
+    """
+    summary = (vuln.get("summary") or "").strip()
+    if summary:
+        return summary[:max_len]
+
+    details = (vuln.get("details") or "").strip()
+    if details:
+        cleaned = details.replace("#", "").replace("*", "")
+        # Pick the first substantive paragraph. OSV details usually open
+        # with a Markdown header like "### Summary" which, once "#" is
+        # stripped, collapses to a single word — useless as a description.
+        # Skip any paragraph shorter than ~20 chars (treat as header).
+        for para in cleaned.split("\n\n"):
+            collapsed = " ".join(para.split()).strip()
+            if len(collapsed) >= 20:
+                return collapsed[:max_len]
+        # Fallback: nothing substantive found — return whatever we have.
+        flat = " ".join(cleaned.split()).strip()
+        if flat:
+            return flat[:max_len]
+
+    return f"No summary or details available in OSV record for {vuln.get('id', 'unknown')}."
+
+
 def build_osv_citation(vuln: dict, retrieved_at: str) -> Citation:
     """
     Construct an authoritative OSV citation from a raw OSV vulnerability
@@ -81,12 +118,12 @@ def build_osv_citation(vuln: dict, retrieved_at: str) -> Citation:
     response — the LLM never produces any of these.
     """
     vuln_id = vuln["id"]
-    summary = (vuln.get("summary") or vuln.get("details") or "")[:100]
+    excerpt = extract_vuln_summary(vuln, max_len=100)
     data: dict[str, Any] = {
         "source": CitationSource.OSV,
         "url": f"https://osv.dev/vulnerability/{vuln_id}",
         "identifier": vuln_id,
-        "excerpt": summary,
+        "excerpt": excerpt,
         "retrieved_at": retrieved_at,
         "confidence": "authoritative",
         "validated": True,
@@ -116,48 +153,135 @@ def build_none_found_citation(reason: str) -> Citation:
     return data  # type: ignore[return-value]
 
 
+def _parse_cvss_vector(vector: str) -> Optional[float]:
+    """
+    Compute the base score from a CVSS v3.x or v4.0 vector string.
+
+    Prefers the `cvss` library (pip install cvss) for accuracy across the
+    whole metric matrix. Falls back to a minimal v3.x base-score
+    implementation if the library isn't installed — enough to keep
+    smoke tests honest in stripped-down environments. Returns None on
+    any parse failure rather than guessing.
+    """
+    if not isinstance(vector, str):
+        return None
+    try:
+        try:
+            from cvss import CVSS3, CVSS4
+            if vector.startswith("CVSS:3"):
+                return float(CVSS3(vector).base_score)
+            if vector.startswith("CVSS:4"):
+                return float(CVSS4(vector).base_score)
+        except ImportError:
+            pass
+
+        # Manual fallback — CVSS v3.x only. Spec at
+        # https://www.first.org/cvss/v3.1/specification-document
+        if not vector.startswith("CVSS:3"):
+            return None
+
+        metrics: dict[str, str] = {}
+        for part in vector.split("/")[1:]:
+            if ":" in part:
+                k, v = part.split(":", 1)
+                metrics[k] = v
+
+        AV = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}.get(metrics.get("AV", ""), 0)
+        AC = {"L": 0.77, "H": 0.44}.get(metrics.get("AC", ""), 0)
+        scope = metrics.get("S", "U")
+        PR_U = {"N": 0.85, "L": 0.62, "H": 0.27}
+        PR_C = {"N": 0.85, "L": 0.68, "H": 0.50}
+        PR = (PR_C if scope == "C" else PR_U).get(metrics.get("PR", ""), 0)
+        UI = {"N": 0.85, "R": 0.62}.get(metrics.get("UI", ""), 0)
+        C_ = {"H": 0.56, "L": 0.22, "N": 0}.get(metrics.get("C", ""), 0)
+        I_ = {"H": 0.56, "L": 0.22, "N": 0}.get(metrics.get("I", ""), 0)
+        A_ = {"H": 0.56, "L": 0.22, "N": 0}.get(metrics.get("A", ""), 0)
+
+        iss = 1 - ((1 - C_) * (1 - I_) * (1 - A_))
+        if scope == "C":
+            impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+        else:
+            impact = 6.42 * iss
+
+        exploitability = 8.22 * AV * AC * PR * UI
+
+        if impact <= 0:
+            return 0.0
+
+        raw = (impact + exploitability) if scope == "U" else 1.08 * (impact + exploitability)
+        base = min(raw, 10)
+
+        import math
+        return math.ceil(base * 10) / 10
+    except Exception:
+        return None
+
+
 def extract_cvss_score(vuln: dict) -> Optional[float]:
     """
-    Pull a numeric CVSS score from an OSV vuln record.
+    Numeric CVSS score from an OSV vuln record, in priority order:
 
-    OSV "severity" is a list of {type, score} entries. We prefer CVSS_V3,
-    fall back to CVSS_V2, and try the database_specific.cvss.score field
-    when neither carries a numeric value (some advisories store the raw
-    CVSS vector string in `score` and the numeric in `database_specific`).
+      1. affected[].database_specific.cvss.score
+         Many GHSA-backed records put a clean numeric here. Easiest win.
 
-    Returns None if no parseable numeric score is found — callers should
-    map None to RiskLevel.MEDIUM via cvss_to_risk_level.
+      2. severity[].score
+         OSV's documented field. In practice the value is a CVSS VECTOR
+         STRING ("CVSS:3.1/AV:N/AC:H/..."), not a number — parse it.
+         Some older records do put a numeric string; we try float() too.
+
+      3. database_specific.severity
+         String label ("CRITICAL" / "HIGH" / "MODERATE" / "LOW") on the
+         vuln itself. Last-resort anchor when nothing parseable exists.
+
+    Returns None if none of the above produce a usable value. Callers map
+    None → RiskLevel.MEDIUM via cvss_to_risk_level (over-routes to human
+    review rather than silently treating unscored CVEs as low).
     """
-    severity_list = vuln.get("severity") or []
-    by_type: dict[str, dict] = {}
-    for entry in severity_list:
-        if isinstance(entry, dict) and entry.get("type"):
-            by_type[entry["type"]] = entry
-
-    for sev_type in ("CVSS_V3", "CVSS_V2"):
-        entry = by_type.get(sev_type)
-        if entry is None:
+    # Priority 1: numeric score in affected[].database_specific.cvss
+    for affected in vuln.get("affected") or []:
+        if not isinstance(affected, dict):
             continue
-        score = entry.get("score")
-        if isinstance(score, (int, float)):
+        cvss = ((affected.get("database_specific") or {}).get("cvss")) or {}
+        score = cvss.get("score")
+        if isinstance(score, (int, float)) and 0.0 <= score <= 10.0:
             return float(score)
         if isinstance(score, str):
             try:
-                return float(score)
+                parsed = float(score)
+                if 0.0 <= parsed <= 10.0:
+                    return parsed
             except ValueError:
-                # The string is a CVSS vector, not a number — fall through.
                 pass
 
+    # Priority 2: severity[].score — usually a CVSS vector string
+    for sev_entry in vuln.get("severity") or []:
+        if not isinstance(sev_entry, dict):
+            continue
+        score_str = sev_entry.get("score")
+        if isinstance(score_str, str) and score_str.startswith("CVSS:"):
+            parsed = _parse_cvss_vector(score_str)
+            if parsed is not None:
+                return parsed
+        if isinstance(score_str, (int, float)):
+            return float(score_str)
+        if isinstance(score_str, str):
+            try:
+                return float(score_str)
+            except ValueError:
+                pass
+
+    # Priority 3: string severity label → numeric anchor
     db_spec = vuln.get("database_specific") or {}
-    cvss_obj = db_spec.get("cvss") or {}
-    score = cvss_obj.get("score")
-    if isinstance(score, (int, float)):
-        return float(score)
-    if isinstance(score, str):
-        try:
-            return float(score)
-        except ValueError:
-            return None
+    sev_label = (db_spec.get("severity") or "").upper()
+    label_to_score = {
+        "CRITICAL": 9.5,
+        "HIGH": 7.5,
+        "MODERATE": 5.5,
+        "MEDIUM": 5.5,
+        "LOW": 3.0,
+    }
+    if sev_label in label_to_score:
+        return label_to_score[sev_label]
 
     return None
 
@@ -248,7 +372,7 @@ def _build_cve_finding(
     finding_type = "cve" if has_ranges else "cve_no_fix"
 
     remediation = _build_version_bump_remediation(vuln, pkg, citations)
-    summary = vuln.get("summary") or vuln.get("details") or "No summary available."
+    summary = extract_vuln_summary(vuln, max_len=200)
     recommendation = (
         f"Upgrade {pkg['name']} to a patched version."
         if remediation else f"No fix available; consider compensating controls."
@@ -301,6 +425,10 @@ async def _query_osv_batch(packages: list[PackageRecord]) -> dict:
     OSV returns results in the SAME ORDER as queries — callers rely on
     zip(packages, results) for alignment.
 
+    NOTE: the batch endpoint returns only `{id: ...}` stubs per vuln,
+    NOT the full record. Callers must follow up with _enrich_vulns to
+    fetch severity / summary / affected data.
+
     aiohttp is imported lazily so the module loads in environments that
     haven't installed it (tests mock this function entirely).
     """
@@ -321,6 +449,49 @@ async def _query_osv_batch(packages: list[PackageRecord]) -> dict:
         async with session.post(OSV_BATCH_URL, json=payload) as resp:
             resp.raise_for_status()
             return await resp.json()
+
+
+async def _enrich_vulns(vuln_ids: set[str]) -> dict[str, dict]:
+    """
+    Fetch the full record for each vuln_id via /v1/vulns/{id}.
+
+    The batch endpoint returns only IDs. severity[], summary, details,
+    and affected[].database_specific.cvss all live on the per-vuln
+    record. Without this enrichment, extract_cvss_score() returns None
+    for every vuln and the priority chain has nothing to work with.
+
+    Concurrent fetches are capped at OSV_ENRICH_CONCURRENCY to avoid
+    hammering OSV. A failed individual fetch yields {"id": vid} so the
+    caller can still attach SOMETHING and the rest of the batch
+    proceeds — a single 404 must not break the whole scan.
+
+    Tests typically mock this function entirely.
+    """
+    if not vuln_ids:
+        return {}
+
+    import aiohttp
+
+    timeout = aiohttp.ClientTimeout(total=OSV_TIMEOUT_SECONDS)
+    sem = asyncio.Semaphore(OSV_ENRICH_CONCURRENCY)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async def fetch_one(vid: str) -> tuple[str, Optional[dict]]:
+            url = OSV_VULN_URL.format(vuln_id=vid)
+            async with sem:
+                try:
+                    async with session.get(url) as resp:
+                        resp.raise_for_status()
+                        return vid, await resp.json()
+                except Exception:
+                    return vid, None
+
+        pairs = await asyncio.gather(*(fetch_one(v) for v in vuln_ids))
+
+    # Only return successful fetches. Callers fall back to the stub for
+    # any id not in this dict, which is also the right behavior when
+    # tests provide already-enriched stubs and skip the network entirely.
+    return {vid: data for vid, data in pairs if data is not None}
 
 
 def _select_cvss_mapping(policy: dict) -> Optional[dict]:
@@ -376,6 +547,32 @@ async def cve_node(state: AgentState) -> dict:
         else:
             results = list(results)[: len(packages)]
 
+    # Collect unique vuln IDs from the batch stubs and fetch full records.
+    # The batch endpoint only returns {"id": ...} per vuln — severity,
+    # summary, and affected[] all live on /v1/vulns/{id}. Without this
+    # enrichment, every finding would collapse to MEDIUM with a
+    # placeholder description.
+    #
+    # Skip enrichment for stubs that ALREADY carry substance (tests inject
+    # full vuln dicts directly into the batch response; we don't want to
+    # round-trip to OSV for those).
+    _STUB_SUBSTANCE_KEYS = ("severity", "affected", "summary", "details")
+    unique_ids: set[str] = set()
+    for result in results:
+        for v in (result or {}).get("vulns") or []:
+            if isinstance(v, dict) and v.get("id"):
+                if not any(v.get(k) for k in _STUB_SUBSTANCE_KEYS):
+                    unique_ids.add(v["id"])
+
+    try:
+        vuln_details = await _enrich_vulns(unique_ids)
+    except Exception as exc:
+        errors.append(
+            f"OSV per-vuln enrichment failed; severity will fall back to "
+            f"the label/None defaults: {exc}"
+        )
+        vuln_details = {}
+
     findings: list[Finding] = []
     packages_with_cves = 0
     vulns_seen = 0
@@ -385,8 +582,14 @@ async def cve_node(state: AgentState) -> dict:
         if not vulns:
             continue
         packages_with_cves += 1
-        for vuln in vulns:
+        for vuln_stub in vulns:
             vulns_seen += 1
+            vuln_id = vuln_stub.get("id") if isinstance(vuln_stub, dict) else None
+            # Prefer the enriched record; fall back to the stub if the
+            # per-vuln fetch failed or this id wasn't in the batch.
+            vuln = vuln_details.get(vuln_id) if vuln_id else None
+            if not vuln:
+                vuln = vuln_stub
             try:
                 citation = build_osv_citation(vuln, retrieved_at_iso)
                 finding = _build_cve_finding(
