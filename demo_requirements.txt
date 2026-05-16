@@ -109,7 +109,7 @@ certifi==2024.2.2
 
 # --- Configuration & Environment ---------------------------------------------
 python-decouple==3.8
-python-dotenv==1.0.1
+python-dotenv==1.2.2
 dynaconf==3.2.4
 
 
