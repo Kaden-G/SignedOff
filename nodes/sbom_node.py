@@ -46,15 +46,23 @@ PIP_LICENSES_TIMEOUT_SECONDS = 60
 LICENSE_NORMALIZATION: dict[str, Optional[str]] = {
     "mit": "MIT",
     "mit license": "MIT",
+    "mit-cmu": "MIT",
     "apache 2.0": "Apache-2.0",
     "apache-2.0": "Apache-2.0",
+    "apache license 2.0": "Apache-2.0",
     "apache software license": "Apache-2.0",
+    "apache software license; bsd license": "Apache-2.0",
+    "apache software license; mit license": "Apache-2.0",
+    "apache-2.0 and mit": "Apache-2.0",
+    "apache-2.0 or bsd-2-clause": "Apache-2.0",
     "bsd": "BSD-3-Clause",
     "bsd license": "BSD-3-Clause",
     "bsd 2-clause": "BSD-2-Clause",
     "bsd-2-clause": "BSD-2-Clause",
     "bsd 3-clause": "BSD-3-Clause",
     "bsd-3-clause": "BSD-3-Clause",
+    "bsd 3-clause or apache-2.0": "BSD-3-Clause",
+    "mit or apache-2.0": "MIT",
     "gnu general public license v2 (gplv2)": "GPL-2.0-only",
     "gnu general public license v2 or later (gplv2+)": "GPL-2.0-or-later",
     "gnu general public license v3 (gplv3)": "GPL-3.0-only",
@@ -68,6 +76,7 @@ LICENSE_NORMALIZATION: dict[str, Optional[str]] = {
     "mozilla public license 2.0 (mpl 2.0)": "MPL-2.0",
     "mpl 2.0": "MPL-2.0",
     "python software foundation license": "Python-2.0",
+    "psf-2.0": "Python-2.0",
     "lgpl": "LGPL-2.1-only",
     "unlicense": "Unlicense",
     "the unlicense (unlicense)": "Unlicense",
@@ -76,18 +85,95 @@ LICENSE_NORMALIZATION: dict[str, Optional[str]] = {
 }
 
 
+def _detect_gpl_in_multi_license(license_str: str) -> Optional[str]:
+    """
+    Compliance-safe GPL detection.
+
+    Returns the most-restrictive GPL SPDX identifier we can infer, or None
+    if no GPL-family license is present. Reasoning:
+
+      - If a license declaration mentions GPL alongside permissive options
+        (e.g. "Apache; GPL; LGPL"), a downstream recipient could choose
+        to receive it under GPL terms — which triggers copyleft regardless
+        of the other available licenses. Compliance-safe interpretation
+        wins.
+
+      - AGPL is always returned, even on single-license inputs — it's
+        network-copyleft and severe enough that the conservative reading
+        ("AGPL-3.0-or-later") is warranted even for "AGPL-3.0-only".
+
+      - Other GPL variants ONLY return a value for multi-license strings
+        (containing ";" or " or " separators). Single-license inputs like
+        "GPLv2" fall through to the explicit normalization map so precise
+        variants (e.g. "GPL-2.0-only" vs "GPL-2.0-or-later") are preserved.
+
+      - Pure LGPL declarations are NOT GPL — return None so the map handles
+        the LGPL-specific mapping.
+    """
+    s = license_str.lower()
+
+    # AGPL: always trigger. Substring check has to come BEFORE the GPL-3
+    # check below, since "agpl-3" contains "gpl-3".
+    if "agpl" in s or "affero" in s:
+        return "AGPL-3.0-or-later"
+
+    # Other GPL variants only get the conservative reading on multi-license
+    # declarations. Single-license inputs use the precise map.
+    is_multi = ";" in s or " or " in s
+    if not is_multi:
+        return None
+
+    # LGPL exclusion: if the only "GPL" mentions are inside "LGPL" /
+    # "Library or Lesser General Public" / "Lesser General Public", treat
+    # as pure LGPL and let the map handle it.
+    has_lgpl = (
+        "lgpl" in s
+        or "lesser general public" in s
+        or "library or lesser" in s
+    )
+    if has_lgpl:
+        stripped = (
+            s.replace("lgpl", "")
+            .replace("library or lesser general public", "")
+            .replace("lesser general public", "")
+        )
+        if "gpl" not in stripped and "general public" not in stripped:
+            return None
+
+    if any(t in s for t in ("gplv3", "gpl v3", "gpl-3", "gpl3")):
+        return "GPL-3.0-or-later"
+    if any(t in s for t in ("gplv2", "gpl v2", "gpl-2", "gpl2")):
+        return "GPL-2.0-or-later"
+
+    # Generic GPL mention with no version → assume most restrictive.
+    if "gpl" in s or "general public license" in s:
+        return "GPL-3.0-or-later"
+
+    return None
+
+
 def normalize_license(raw: Optional[str]) -> tuple[Optional[str], bool]:
     """
     Map a pip-licenses string to an SPDX identifier.
 
-    Returns (value, recognized). If the input is in LICENSE_NORMALIZATION,
-    returns (spdx_or_None, True). Otherwise returns (raw_string, False)
-    so the caller can log a warning and the reviewer still sees what was
-    reported.
+    Returns (value, recognized). Order of operations:
+      1. None / empty / "unknown" sentinel → (None, True).
+      2. Compliance-safe GPL detection — runs BEFORE map lookup so any
+         multi-license string containing GPL gets the conservative SPDX
+         identifier (and so AGPL is caught regardless of phrasing).
+      3. Explicit map lookup for precise single-license mapping.
+      4. Otherwise return (raw, False) so the caller can log a warning.
     """
     if raw is None:
         return None, True
     key = raw.strip().lower()
+    if key in ("", "unknown"):
+        return None, True
+
+    gpl_detected = _detect_gpl_in_multi_license(raw)
+    if gpl_detected:
+        return gpl_detected, True
+
     if key in LICENSE_NORMALIZATION:
         return LICENSE_NORMALIZATION[key], True
     return raw, False

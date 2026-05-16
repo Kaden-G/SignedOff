@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from cache.l1_package_cache import l1_cache  # noqa: E402
 from nodes.sbom_node import (  # noqa: E402
+    _detect_gpl_in_multi_license,
     normalize_license,
     parse_direct_package_names,
     sbom_node,
@@ -233,6 +234,95 @@ def test_l1_cache_hit_increments_counter_and_populates_record():
     assert django["cached_at"] is not None
     assert django["cves"] == [{"id": "CVE-test"}]
 
+
+# ---------------------------------------------------------------------------
+# Bug B: expanded LICENSE_NORMALIZATION mappings
+# ---------------------------------------------------------------------------
+
+def test_normalization_handles_real_world_pip_licenses_strings():
+    cases = [
+        ("Apache License 2.0", "Apache-2.0"),
+        ("Apache Software License; BSD License", "Apache-2.0"),
+        ("Apache Software License; MIT License", "Apache-2.0"),
+        ("Apache-2.0 AND MIT", "Apache-2.0"),
+        ("Apache-2.0 OR BSD-2-Clause", "Apache-2.0"),
+        ("BSD 3-Clause OR Apache-2.0", "BSD-3-Clause"),
+        ("MIT OR Apache-2.0", "MIT"),
+        ("MIT-CMU", "MIT"),
+        ("PSF-2.0", "Python-2.0"),
+    ]
+    for raw, expected in cases:
+        spdx, recognized = normalize_license(raw)
+        assert recognized, f"{raw!r} should be recognized; got ({spdx!r}, False)"
+        assert spdx == expected, f"{raw!r} → {spdx!r}, expected {expected!r}"
+
+
+# ---------------------------------------------------------------------------
+# Bug C: GPL detection in multi-license strings (compliance correctness)
+# ---------------------------------------------------------------------------
+
+def test_artistic_plus_gpl_plus_gplv2plus_detected_as_gpl_2_or_later():
+    raw = ("Artistic License; GNU General Public License (GPL); "
+           "GNU General Public License v2 or later (GPLv2+)")
+    assert _detect_gpl_in_multi_license(raw) == "GPL-2.0-or-later"
+    spdx, recognized = normalize_license(raw)
+    assert spdx == "GPL-2.0-or-later"
+    assert recognized is True
+
+
+def test_apache_plus_gpl_plus_lgpl_does_not_hide_gpl():
+    # LGPL is co-listed but the standalone GPL mention still triggers detection.
+    raw = ("Apache Software License; GNU General Public License (GPL); "
+           "GNU Library or Lesser General Public License (LGPL)")
+    detected = _detect_gpl_in_multi_license(raw)
+    assert detected is not None, "LGPL co-listing must not mask the GPL mention"
+    assert detected.startswith("GPL-"), f"expected GPL family, got {detected}"
+
+
+def test_pure_lgpl_does_not_trigger_gpl_detection():
+    # Various phrasings that mean LGPL only — no real GPL mention.
+    assert _detect_gpl_in_multi_license("LGPL-2.1-only") is None
+    assert _detect_gpl_in_multi_license("GNU Lesser General Public License (LGPL)") is None
+    assert _detect_gpl_in_multi_license(
+        "GNU Library or Lesser General Public License (LGPL)"
+    ) is None
+
+
+def test_agpl_always_detected_even_single_license():
+    # AGPL is severe enough that the conservative interpretation applies
+    # even for single-license strings (no semicolon or "or" separator).
+    assert _detect_gpl_in_multi_license("AGPL-3.0-only") == "AGPL-3.0-or-later"
+    assert _detect_gpl_in_multi_license("AGPL-3.0-or-later") == "AGPL-3.0-or-later"
+    assert _detect_gpl_in_multi_license("GNU Affero General Public License v3") == "AGPL-3.0-or-later"
+
+    spdx, recognized = normalize_license("AGPL-3.0-only")
+    assert recognized is True
+    assert spdx == "AGPL-3.0-or-later"
+
+
+def test_single_license_gplv2_still_maps_precisely_via_normalization_map():
+    # Single-license "GPLv2" stays GPL-2.0-only — detection does NOT
+    # downgrade to the conservative "or-later" reading for single-license
+    # inputs (only multi-license triggers that).
+    spdx, recognized = normalize_license("GNU General Public License v2 (GPLv2)")
+    assert recognized is True
+    assert spdx == "GPL-2.0-only"
+
+
+def test_gpl_v3_detected_from_multi_license():
+    raw = "MIT; GNU General Public License v3 (GPLv3)"
+    assert _detect_gpl_in_multi_license(raw) == "GPL-3.0-or-later"
+
+
+def test_generic_gpl_in_multi_license_assumes_most_restrictive():
+    # Generic "GPL" mention with no version in a multi-license declaration.
+    raw = "MIT; GNU General Public License (GPL)"
+    assert _detect_gpl_in_multi_license(raw) == "GPL-3.0-or-later"
+
+
+# ---------------------------------------------------------------------------
+# Original test (kept below as final sbom integration check)
+# ---------------------------------------------------------------------------
 
 def test_include_transitive_false_filters_out_indirect_packages():
     policy = {

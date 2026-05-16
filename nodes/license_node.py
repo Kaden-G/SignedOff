@@ -450,6 +450,7 @@ def _build_llm_finding(
     ]
 
     if compatible == "yes":
+        pkg["license_status"] = "compliant"
         return None  # compliant per LLM — no Finding
 
     if compatible == "no":
@@ -457,11 +458,13 @@ def _build_llm_finding(
         if severity == RiskLevel.NONE:
             severity = RiskLevel.HIGH
         counters["violations_found"] += 1
+        pkg["license_status"] = "violation"
     else:
         finding_type = "license_restricted"
         if severity == RiskLevel.NONE:
             severity = RiskLevel.MEDIUM
         counters["restricted_found"] += 1
+        pkg["license_status"] = "restricted"
 
     return _make_finding(
         pkg,
@@ -495,19 +498,23 @@ async def _evaluate_license(
 
     if not license_id:
         counters["unknown_found"] += 1
+        pkg["license_status"] = "unknown"
         return _evaluate_unknown(pkg, use_case, unknown_action)
 
     # Stage 1: policy fast-path
     if license_id in allowed:
+        pkg["license_status"] = "compliant"
         return None
     if license_id in blocked:
         counters["violations_found"] += 1
+        pkg["license_status"] = "violation"
         return _evaluate_blocked(pkg, license_id, use_case, spdx_dataset, curated)
 
     # Stage 2: SPDX lookup
     spdx_entry = spdx_dataset.get(license_id)
     if not spdx_entry:
         counters["unknown_found"] += 1
+        pkg["license_status"] = "unknown"
         return _evaluate_unknown(
             pkg,
             use_case,
@@ -526,6 +533,10 @@ async def _evaluate_license(
             f"LLM reasoning failed for {pkg['name']}=={pkg['version']} "
             f"({license_id}): {exc}"
         )
+        # Defensive path: LLM failure means we couldn't classify the
+        # license. Mark the package as "unknown" even though we emit a
+        # restricted-finding to route this to human review.
+        pkg["license_status"] = "unknown"
         return _make_finding(
             pkg,
             finding_type="license_restricted",
@@ -544,6 +555,7 @@ async def _evaluate_license(
             decision_status=DecisionStatus.HUMAN_REVIEW,
         )
 
+    # _build_llm_finding sets pkg["license_status"] based on LLM verdict.
     return _build_llm_finding(pkg, license_id, spdx_entry, reasoning, use_case, counters)
 
 
@@ -614,6 +626,11 @@ async def license_node(state: AgentState) -> dict:
 
     return {
         "license_findings": findings,
+        # license_status was mutated in place on each PackageRecord above;
+        # returning packages explicitly ensures LangGraph propagates the
+        # update at fan-in (CVENode does not return packages, so there is
+        # no parallel-write conflict).
+        "packages": packages,
         "audit_events": [_license_scan_complete_event(counters, len(packages))],
         "errors": errors,
     }

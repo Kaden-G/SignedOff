@@ -240,6 +240,161 @@ def test_llm_failure_falls_back_to_human_review_finding(monkeypatch):
     assert CitationSource.NONE_FOUND in sources
 
 
+# ---------------------------------------------------------------------------
+# Bug A: license_status must be written on every evaluation path
+# ---------------------------------------------------------------------------
+
+def _packages_from(result: dict) -> list[dict]:
+    """LicenseNode now returns the (mutated) packages list in its dict."""
+    pkgs = result.get("packages")
+    assert pkgs is not None, "license_node must return packages so LangGraph sees license_status updates"
+    return pkgs
+
+
+def test_fast_path_allowed_sets_license_status_compliant_with_no_finding(monkeypatch):
+    _stub_loaders(monkeypatch)
+    pkg = _pkg(name="requests", version="2.31.0", license_id="MIT")
+    result = _run(license_node(_state([pkg])))
+
+    assert result["license_findings"] == []
+    out_pkg = _packages_from(result)[0]
+    assert out_pkg["license_status"] == "compliant"
+    # And the original dict was mutated in place (same reference).
+    assert pkg["license_status"] == "compliant"
+
+
+def test_fast_path_blocked_sets_license_status_violation_with_critical_finding(monkeypatch):
+    _stub_loaders(monkeypatch)
+    pkg = _pkg(name="somepkg", version="1.0.0", license_id="GPL-3.0-only")
+    result = _run(license_node(_state([pkg])))
+
+    assert len(result["license_findings"]) == 1
+    assert result["license_findings"][0]["severity"] == RiskLevel.CRITICAL
+    assert _packages_from(result)[0]["license_status"] == "violation"
+
+
+def test_missing_license_sets_license_status_unknown_with_medium_finding(monkeypatch):
+    _stub_loaders(monkeypatch)
+    pkg = _pkg(name="mystery", version="0.1", license_id=None)
+    result = _run(license_node(_state([pkg])))
+
+    assert len(result["license_findings"]) == 1
+    assert result["license_findings"][0]["finding_type"] == "license_unknown"
+    assert _packages_from(result)[0]["license_status"] == "unknown"
+
+
+def test_spdx_miss_sets_license_status_unknown(monkeypatch):
+    _stub_loaders(monkeypatch)
+    pkg = _pkg(name="weird", version="1.0", license_id="My-Custom-License-3.0")
+    result = _run(license_node(_state([pkg])))
+
+    assert _packages_from(result)[0]["license_status"] == "unknown"
+
+
+def test_llm_says_compatible_yes_sets_license_status_compliant(monkeypatch):
+    _stub_loaders(monkeypatch)
+    fake = {
+        "compatible": "yes",
+        "conditions": None,
+        "risk_level": "none",
+        "explanation": "Permissive license.",
+    }
+    pkg = _pkg(name="mpl_pkg", version="1.0", license_id="MPL-2.0")
+    with patch(
+        "nodes.license_node._call_llm_for_license_reasoning",
+        new=AsyncMock(return_value=fake),
+    ):
+        result = _run(license_node(_state([pkg])))
+
+    assert result["license_findings"] == []
+    assert _packages_from(result)[0]["license_status"] == "compliant"
+
+
+def test_llm_says_compatible_no_sets_license_status_violation(monkeypatch):
+    _stub_loaders(monkeypatch)
+    fake = {
+        "compatible": "no",
+        "conditions": None,
+        "risk_level": "high",
+        "explanation": "Incompatible with declared use case.",
+    }
+    pkg = _pkg(name="mpl_pkg", version="1.0", license_id="MPL-2.0")
+    with patch(
+        "nodes.license_node._call_llm_for_license_reasoning",
+        new=AsyncMock(return_value=fake),
+    ):
+        result = _run(license_node(_state([pkg])))
+
+    assert len(result["license_findings"]) == 1
+    assert _packages_from(result)[0]["license_status"] == "violation"
+
+
+def test_llm_says_conditional_sets_license_status_restricted(monkeypatch):
+    _stub_loaders(monkeypatch)
+    fake = {
+        "compatible": "conditional",
+        "conditions": "Linking model matters",
+        "risk_level": "high",
+        "explanation": "LGPL: dynamic vs static linking.",
+    }
+    pkg = _pkg(name="readline", version="0.1", license_id="LGPL-2.1-only")
+    with patch(
+        "nodes.license_node._call_llm_for_license_reasoning",
+        new=AsyncMock(return_value=fake),
+    ):
+        result = _run(license_node(_state([pkg])))
+
+    assert len(result["license_findings"]) == 1
+    assert result["license_findings"][0]["finding_type"] == "license_restricted"
+    assert _packages_from(result)[0]["license_status"] == "restricted"
+
+
+def test_llm_failure_sets_license_status_unknown_defensive_path(monkeypatch):
+    _stub_loaders(monkeypatch)
+
+    async def boom(*_a, **_kw):
+        raise RuntimeError("LLM down")
+
+    pkg = _pkg(name="lgpl_pkg", version="1.0", license_id="LGPL-2.1-only")
+    with patch("nodes.license_node._call_llm_for_license_reasoning", side_effect=boom):
+        result = _run(license_node(_state([pkg])))
+
+    assert _packages_from(result)[0]["license_status"] == "unknown"
+
+
+def test_mixed_packages_each_get_correct_license_status(monkeypatch):
+    """Smoke-test the path matrix in a single batch."""
+    _stub_loaders(monkeypatch)
+    fake = {
+        "compatible": "no",
+        "conditions": None,
+        "risk_level": "high",
+        "explanation": "Incompatible.",
+    }
+    packages = [
+        _pkg(name="clean", version="1.0", license_id="MIT"),
+        _pkg(name="bad", version="1.0", license_id="GPL-3.0-only"),
+        _pkg(name="mystery", version="0.1", license_id=None),
+        _pkg(name="review", version="0.1", license_id="MPL-2.0"),
+    ]
+    with patch(
+        "nodes.license_node._call_llm_for_license_reasoning",
+        new=AsyncMock(return_value=fake),
+    ):
+        result = _run(license_node(_state(packages)))
+
+    by_name = {p["name"]: p for p in _packages_from(result)}
+    assert by_name["clean"]["license_status"] == "compliant"
+    assert by_name["bad"]["license_status"] == "violation"
+    assert by_name["mystery"]["license_status"] == "unknown"
+    assert by_name["review"]["license_status"] == "violation"  # LLM said "no"
+
+
+# ---------------------------------------------------------------------------
+# Original tests below
+# ---------------------------------------------------------------------------
+
+
 def test_license_not_in_spdx_dataset_treated_as_unknown(monkeypatch):
     _stub_loaders(monkeypatch)
     pkg = _pkg(name="weird", version="1.0", license_id="My-Custom-License-3.0")
