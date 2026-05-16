@@ -532,3 +532,60 @@ def test_findings_carry_contextualization_fields_initialized_to_none():
     f = result["cve_findings"][0]
     assert f["contextualized_severity"] is None
     assert f["contextualization_rationale"] is None
+
+
+def test_cve_node_return_dict_contains_raw_osv_records_for_multiple_packages():
+    """
+    Regression test for a bug where CVENode built raw_osv_records
+    locally but forgot to include it in its return dict. RiskNode then
+    saw an empty {} via state.update(...) and skipped every
+    HIGH/CRITICAL contextualization. The contract is: raw_osv_records
+    MUST appear in the return dict, keyed by finding_id, with each
+    value being the full OSV vuln record (not just an id reference).
+    """
+    pkgs = [_pkg("django", "4.2.3"), _pkg("requests", "2.28.0")]
+    requests_vuln = {
+        "id": "GHSA-requests-test",
+        "summary": "Test vuln in requests with full body.",
+        "severity": [{"type": "CVSS_V3", "score": "5.0"}],
+        "affected": [{
+            "package": {"ecosystem": "PyPI", "name": "requests"},
+            "ranges": [{"type": "ECOSYSTEM",
+                        "events": [{"introduced": "0"}, {"fixed": "2.31.0"}]}],
+        }],
+    }
+    response = {"results": [
+        {"vulns": [VULN_DJANGO]},
+        {"vulns": [requests_vuln]},
+    ]}
+    with patch("nodes.cve_node._query_osv_batch",
+               new=AsyncMock(return_value=response)):
+        result = _run(cve_node(_state(packages=pkgs)))
+
+    # Contract: the field is present on the return dict.
+    assert "raw_osv_records" in result, (
+        f"raw_osv_records missing from return dict: keys={list(result.keys())}"
+    )
+    raw = result["raw_osv_records"]
+
+    # Exactly one record per finding, keyed by finding_id.
+    finding_ids = {f["finding_id"] for f in result["cve_findings"]}
+    assert set(raw.keys()) == finding_ids, (
+        f"key mismatch: extra={set(raw.keys()) - finding_ids}, "
+        f"missing={finding_ids - set(raw.keys())}"
+    )
+    assert len(raw) == 2
+
+    # Each value is the FULL OSV vuln object, not a {"id": ...} stub.
+    for vuln in raw.values():
+        assert isinstance(vuln, dict)
+        assert vuln.get("id"), "raw record missing id"
+        # The substantive fields that distinguish a full record from a stub.
+        assert vuln.get("summary") or vuln.get("details") or vuln.get("affected"), (
+            f"raw record looks like a stub, not a full vuln: {vuln}"
+        )
+
+    # The matched ids should be exactly the input vuln ids — no scrambling.
+    assert {v["id"] for v in raw.values()} == {
+        "GHSA-qm57-vhq3-3fwf", "GHSA-requests-test",
+    }
