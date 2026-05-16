@@ -138,6 +138,7 @@ async def report_node(state: AgentState) -> dict:
         "packages": packages,
         "license_findings": license_findings,
         "cve_findings": cve_findings,
+        "raw_dependency_tree": state.get("raw_dependency_tree") or {},
         "audit_trail_entry_count": len(audit_trail),
         "chain_valid": verification["chain_valid"],
     }

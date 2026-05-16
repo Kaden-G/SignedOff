@@ -411,3 +411,184 @@ def test_use_case_echoed_across_job_context_endpoints(client):
             assert r.json().get("use_case") == "distributed_binary", (
                 f"{ep} did not echo use_case: {r.json()}"
             )
+
+
+# ---------------------------------------------------------------------------
+# GET /demo/requirements
+# ---------------------------------------------------------------------------
+
+def test_get_demo_requirements_returns_file_content(client):
+    resp = client.get("/demo/requirements")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["filename"] == "demo_requirements.txt"
+    # Sentinel substrings from the real demo file
+    assert "django==4.2.3" in body["content"]
+    assert "mysqlclient" in body["content"]
+
+
+# ---------------------------------------------------------------------------
+# Dependency chain builder
+# ---------------------------------------------------------------------------
+
+def _sample_tree():
+    """Pipdeptree-shaped tree: factory-boy → faker → text-unidecode."""
+    return [
+        {
+            "package_name": "factory-boy",
+            "installed_version": "3.3.0",
+            "dependencies": [
+                {
+                    "package_name": "faker",
+                    "installed_version": "24.0.0",
+                    "dependencies": [
+                        {
+                            "package_name": "text-unidecode",
+                            "installed_version": "1.3",
+                            "dependencies": [],
+                        }
+                    ],
+                }
+            ],
+        },
+        {
+            "package_name": "django",
+            "installed_version": "4.2.3",
+            "dependencies": [],
+        },
+    ]
+
+
+def test_build_dependency_chains_direct_dep_has_empty_chain():
+    chains = api._build_dependency_chains({"tree": _sample_tree()})
+    assert chains["django"] == []
+    assert chains["factory-boy"] == []
+
+
+def test_build_dependency_chains_transitive_dep_has_parent_chain():
+    chains = api._build_dependency_chains({"tree": _sample_tree()})
+    assert chains["faker"] == ["factory-boy"]
+    assert chains["text-unidecode"] == ["factory-boy", "faker"]
+
+
+def test_build_dependency_chains_accepts_bare_list_form():
+    """Should also accept the bare list (un-wrapped) shape."""
+    chains = api._build_dependency_chains(_sample_tree())
+    assert chains["faker"] == ["factory-boy"]
+
+
+def test_build_dependency_chains_handles_empty_and_garbage_input():
+    assert api._build_dependency_chains({}) == {}
+    assert api._build_dependency_chains(None) == {}
+    assert api._build_dependency_chains({"tree": []}) == {}
+    # Malformed entries should be ignored, not crash.
+    weird = {"tree": [{"no_name_field": True, "dependencies": [None, "bad"]}]}
+    assert api._build_dependency_chains(weird) == {}
+
+
+# ---------------------------------------------------------------------------
+# Risk matrix — dependency_chain on rows
+# ---------------------------------------------------------------------------
+
+def _seed_completed_report_with_tree(job_id: str = "job-rm-chain"):
+    """Like _seed_completed_report but seeds packages whose names match the
+    sample tree so we can assert chain placement on grouped rows."""
+    from nodes.report_node import _reports
+    _seed_job(job_id, use_case="saas")
+    _reports[job_id] = {
+        "job_id": job_id,
+        "use_case": "saas",
+        "scanned_at": "2026-05-15T10:00:00Z",
+        "completed_at": "2026-05-15T10:00:31Z",
+        "summary": {},
+        "packages": [
+            {"name": "django", "version": "4.2.3", "transitive": False,
+             "from_cache": False, "license": "BSD-3-Clause",
+             "license_status": "compliant",
+             "license_risk": RiskLevel.NONE, "security_risk": RiskLevel.NONE,
+             "cves": [], "cached_at": None},
+            {"name": "factory-boy", "version": "3.3.0", "transitive": False,
+             "from_cache": False, "license": "MIT",
+             "license_status": "compliant",
+             "license_risk": RiskLevel.NONE, "security_risk": RiskLevel.NONE,
+             "cves": [], "cached_at": None},
+            {"name": "faker", "version": "24.0.0", "transitive": True,
+             "from_cache": False, "license": "MIT",
+             "license_status": "compliant",
+             "license_risk": RiskLevel.NONE, "security_risk": RiskLevel.NONE,
+             "cves": [], "cached_at": None},
+            {"name": "text-unidecode", "version": "1.3", "transitive": True,
+             "from_cache": False, "license": "Artistic-1.0",
+             "license_status": "restricted",
+             "license_risk": RiskLevel.MEDIUM, "security_risk": RiskLevel.NONE,
+             "cves": [], "cached_at": None},
+        ],
+        "cve_findings": [],
+        "license_findings": [],
+        "raw_dependency_tree": {"tree": _sample_tree()},
+        "audit_trail_entry_count": 1,
+        "chain_valid": True,
+        "executive_summary": "stub",
+    }
+
+
+def test_risk_matrix_grouped_includes_dependency_chain_field(client):
+    _seed_completed_report_with_tree()
+    with _patch_graph():
+        resp = client.get("/scan/risk-matrix/job-rm-chain?view=grouped")
+    assert resp.status_code == 200
+    rows = {r["package"]: r for r in resp.json()["rows"]}
+    for pkg in ("django", "factory-boy", "faker", "text-unidecode"):
+        assert "dependency_chain" in rows[pkg], (
+            f"dependency_chain missing on row for {pkg}"
+        )
+
+
+def test_risk_matrix_grouped_chain_is_empty_for_direct_deps(client):
+    _seed_completed_report_with_tree()
+    with _patch_graph():
+        resp = client.get("/scan/risk-matrix/job-rm-chain?view=grouped")
+    rows = {r["package"]: r for r in resp.json()["rows"]}
+    assert rows["django"]["dependency_chain"] == []
+    assert rows["factory-boy"]["dependency_chain"] == []
+
+
+def test_risk_matrix_grouped_chain_lists_parents_for_transitives(client):
+    _seed_completed_report_with_tree()
+    with _patch_graph():
+        resp = client.get("/scan/risk-matrix/job-rm-chain?view=grouped")
+    rows = {r["package"]: r for r in resp.json()["rows"]}
+    assert rows["faker"]["dependency_chain"] == ["factory-boy"]
+    assert rows["text-unidecode"]["dependency_chain"] == [
+        "factory-boy", "faker"
+    ]
+
+
+def test_risk_matrix_grouped_chain_defaults_to_empty_for_unknown_package(client):
+    """A package that exists in the report but not the dep tree gets []."""
+    from nodes.report_node import _reports
+    _seed_completed_report_with_tree()
+    _reports["job-rm-chain"]["packages"].append({
+        "name": "orphan", "version": "0.1", "transitive": True,
+        "from_cache": False, "license": "MIT", "license_status": "compliant",
+        "license_risk": RiskLevel.NONE, "security_risk": RiskLevel.NONE,
+        "cves": [], "cached_at": None,
+    })
+    with _patch_graph():
+        resp = client.get("/scan/risk-matrix/job-rm-chain?view=grouped")
+    rows = {r["package"]: r for r in resp.json()["rows"]}
+    assert rows["orphan"]["dependency_chain"] == []
+
+
+# ---------------------------------------------------------------------------
+# Static dashboard mount
+# ---------------------------------------------------------------------------
+
+def test_root_serves_static_dashboard_html(client):
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers.get("content-type", "")
+    body = resp.text
+    # Sanity-check the dashboard markup is present
+    assert "SignedOff" in body
+    assert "Compliance officer for Python supply chains" in body

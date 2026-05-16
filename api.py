@@ -29,6 +29,8 @@ load_dotenv()
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import FileResponse  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel, Field, field_validator  # noqa: E402
 from typing_extensions import Literal  # noqa: E402
 
@@ -390,10 +392,46 @@ async def get_risk_matrix(
     return _build_grouped_view(report)
 
 
+def _build_dependency_chains(raw_tree) -> dict[str, list[str]]:
+    """
+    Walk the pipdeptree JSON tree and produce a map of:
+      package_name (lower) -> list of parent packages (the chain that pulled it in).
+    For direct deps, the list is empty.
+
+    Accepts either the raw pipdeptree list-of-dicts shape or the wrapped
+    {"tree": [...]} shape used in AgentState["raw_dependency_tree"].
+    """
+    if isinstance(raw_tree, dict):
+        tree = raw_tree.get("tree") or []
+    elif isinstance(raw_tree, list):
+        tree = raw_tree
+    else:
+        tree = []
+
+    chains: dict[str, list[str]] = {}
+
+    def walk(node: dict, ancestors: list[str]) -> None:
+        if not isinstance(node, dict):
+            return
+        raw_name = node.get("package_name") or node.get("key") or ""
+        name = raw_name.lower()
+        if name and name not in chains:
+            chains[name] = list(ancestors)
+        next_ancestors = ancestors + [name] if name else list(ancestors)
+        for dep in node.get("dependencies") or []:
+            walk(dep, next_ancestors)
+
+    if isinstance(tree, list):
+        for top in tree:
+            walk(top, [])
+    return chains
+
+
 def _build_grouped_view(report: dict) -> dict:
     packages = report.get("packages") or []
     all_findings = (report.get("license_findings") or []) + (report.get("cve_findings") or [])
     use_case = report.get("use_case")
+    chains = _build_dependency_chains(report.get("raw_dependency_tree") or {})
 
     findings_by_pkg: dict[tuple[str, str], list[dict]] = {}
     for f in all_findings:
@@ -417,6 +455,7 @@ def _build_grouped_view(report: dict) -> dict:
             "finding_ids": [f["finding_id"] for f in pkg_findings],
             "action_label": _derive_action_label(pkg_findings, license_risk, security_risk),
             "has_fix_available": any(_has_fix(f) for f in pkg_findings),
+            "dependency_chain": chains.get(pkg["name"].lower(), []),
         })
 
     rows.sort(key=lambda r: (
@@ -636,3 +675,38 @@ async def verify_audit(job_id: str):
         "citations_verified": 0,
         "verdict": result["verdict"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Demo helper + static dashboard
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+_DEMO_REQUIREMENTS_PATH = os.path.join(
+    os.path.dirname(__file__), "demo_requirements.txt"
+)
+
+
+@app.get("/demo/requirements", include_in_schema=False)
+async def get_demo_requirements():
+    """Return demo_requirements.txt contents for the 'Use Demo Data' button."""
+    try:
+        with open(_DEMO_REQUIREMENTS_PATH) as f:
+            content = f.read()
+    except FileNotFoundError:
+        raise _err(404, "demo_not_found", "demo_requirements.txt not found")
+    return {"content": content, "filename": "demo_requirements.txt"}
+
+
+if os.path.isdir(_STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def serve_dashboard():
+    index_path = os.path.join(_STATIC_DIR, "index.html")
+    if not os.path.isfile(index_path):
+        raise _err(404, "dashboard_not_built", "static/index.html not found")
+    return FileResponse(index_path)

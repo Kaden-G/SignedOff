@@ -1,0 +1,1198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>SignedOff — Compliance Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html, body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .fade-in { animation: fadeIn 150ms ease-in-out; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: translateY(0); } }
+  .pulse-dot { display: inline-block; width: 8px; height: 8px; border-radius: 9999px; background: currentColor; animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+  .tooltip { position: relative; }
+  .tooltip:hover .tooltip-body { opacity: 1; visibility: visible; }
+  .tooltip-body { position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%); background: #0f172a; color: #fff; font-size: 11px; padding: 6px 8px; border-radius: 4px; white-space: nowrap; opacity: 0; visibility: hidden; transition: opacity 150ms ease-in-out; z-index: 30; pointer-events: none; max-width: 320px; white-space: normal; min-width: 200px; }
+  .spinner { border: 2px solid rgba(255,255,255,0.3); border-top: 2px solid #fff; border-radius: 50%; width: 14px; height: 14px; animation: spin 0.8s linear infinite; display: inline-block; }
+  @keyframes spin { 100% { transform: rotate(360deg); } }
+  .verify-reveal { animation: revealBanner 400ms ease-out; }
+  @keyframes revealBanner { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+
+<!-- =============================================================
+     HEADER
+     ============================================================= -->
+<header class="sticky top-0 z-20 bg-white border-b border-slate-200">
+  <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+    <div>
+      <div class="text-xl font-semibold text-indigo-600 tracking-tight">SignedOff</div>
+      <div class="text-xs text-slate-500">Compliance officer for Python supply chains</div>
+    </div>
+    <div id="header-pills" class="flex items-center gap-3"></div>
+  </div>
+</header>
+
+<main id="main" class="max-w-7xl mx-auto px-6 py-8">
+  <section id="section-input"></section>
+  <section id="section-progress" class="hidden"></section>
+  <section id="section-results" class="hidden"></section>
+  <section id="section-audit" class="hidden mt-8"></section>
+</main>
+
+<footer class="border-t border-slate-200 bg-white">
+  <div class="max-w-7xl mx-auto px-6 py-6 flex items-center justify-between text-xs text-slate-400">
+    <div>SignedOff v1.0 — Hash-chained, citation-backed compliance</div>
+    <div id="footer-usecase"></div>
+  </div>
+</footer>
+
+<script>
+"use strict";
+
+// ============================================================================
+// State
+// ============================================================================
+const state = {
+  currentJobId: null,
+  scanStatus: null,
+  scanResults: null,
+  riskMatrix: null,
+  pendingReview: null,
+  auditTrail: null,
+  auditExpanded: false,
+  verifyResult: null,
+  verifyingChain: false,
+  expandedFindingId: null,
+  scrollToFindingId: null,
+  uploadedFile: null,
+  uploadedContent: null,
+  useCase: "saas",
+  filters: {
+    severity: [],
+    type: "all",
+    transitive: "all",
+    decision: "all",
+    search: "",
+  },
+  pollingInterval: null,
+  decisionDrafts: {},
+  decisionSubmitting: {},
+};
+
+const SEVERITY_ORDER = { critical: 4, high: 3, medium: 2, low: 1, none: 0 };
+
+const SEV_CLASSES = {
+  critical: "bg-red-100 text-red-900 border-red-300",
+  high: "bg-orange-100 text-orange-900 border-orange-300",
+  medium: "bg-amber-100 text-amber-900 border-amber-300",
+  low: "bg-blue-100 text-blue-900 border-blue-300",
+  none: "bg-slate-100 text-slate-600 border-slate-200",
+};
+
+const CITATION_CLASSES = {
+  osv: "bg-blue-100 text-blue-800",
+  nvd: "bg-blue-100 text-blue-800",
+  spdx: "bg-green-100 text-green-800",
+  ghsa: "bg-blue-100 text-blue-800",
+  pypi: "bg-slate-100 text-slate-700",
+  llm_inference: "bg-yellow-100 text-yellow-900 border border-yellow-300",
+  none_found: "bg-slate-200 text-slate-600",
+  policy: "bg-purple-100 text-purple-800",
+};
+
+const USE_CASE_LABELS = {
+  saas: "SaaS",
+  internal: "Internal",
+  distributed_binary: "Distributed Binary",
+};
+
+const PHASE_LABELS = {
+  initializing: { label: "Initializing", icon: "•" },
+  resolving_dependencies: { label: "Resolving dependencies", icon: "↳" },
+  license_scan: { label: "Scanning licenses", icon: "§" },
+  cve_scan: { label: "Checking CVEs", icon: "⚠" },
+  risk_analysis: { label: "Analyzing risk", icon: "◆" },
+  awaiting_review: { label: "Awaiting human review", icon: "✋" },
+  finalizing: { label: "Finalizing report", icon: "✓" },
+  complete: { label: "Scan complete", icon: "✓" },
+  failed: { label: "Scan failed", icon: "✕" },
+};
+
+// ============================================================================
+// Utilities
+// ============================================================================
+function esc(s) {
+  if (s === null || s === undefined) return "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function fmtDate(iso) {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString();
+  } catch (e) {
+    return iso;
+  }
+}
+
+function shortJobId(id) {
+  if (!id) return "";
+  return id.length > 16 ? id.slice(0, 16) + "…" : id;
+}
+
+function sevPill(level, extraClass = "") {
+  const lvl = (level || "none").toLowerCase();
+  const cls = SEV_CLASSES[lvl] || SEV_CLASSES.none;
+  return `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border ${cls} ${extraClass}">${esc(lvl.toUpperCase())}</span>`;
+}
+
+function citationBadge(source) {
+  const src = (source || "none_found").toLowerCase();
+  const cls = CITATION_CLASSES[src] || "bg-slate-100 text-slate-700";
+  const label = src.replace(/_/g, " ").toUpperCase();
+  if (src === "llm_inference") {
+    return `<span class="tooltip inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium ${cls}">
+      <span aria-hidden="true">⚠</span>${esc(label)}
+      <span class="tooltip-body">LLM-derived reasoning. Lower confidence. Always requires human review per policy.</span>
+    </span>`;
+  }
+  if (src === "none_found") {
+    return `<span class="tooltip inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${cls}">${esc(label)}
+      <span class="tooltip-body">No authoritative evidence was retrieved. Finding requires human review.</span>
+    </span>`;
+  }
+  return `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${cls}">${esc(label)}</span>`;
+}
+
+function statusPill(status) {
+  const cfg = {
+    running:        { cls: "bg-blue-100 text-blue-800",    label: "Running",          pulse: true },
+    awaiting_human: { cls: "bg-amber-100 text-amber-900",  label: "Awaiting Review",  pulse: false },
+    complete:       { cls: "bg-green-100 text-green-800",  label: "Complete",         pulse: false },
+    failed:         { cls: "bg-red-100 text-red-800",      label: "Failed",           pulse: false },
+  }[status] || { cls: "bg-slate-100 text-slate-700", label: status || "Unknown", pulse: false };
+  const dot = cfg.pulse ? `<span class="pulse-dot mr-2"></span>` : "";
+  return `<span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium ${cfg.cls}">${dot}${esc(cfg.label)}</span>`;
+}
+
+function overallStatusPill(status) {
+  const map = {
+    human_review:    { cls: "bg-amber-100 text-amber-900",  label: "Awaiting Review" },
+    auto_remediate:  { cls: "bg-indigo-100 text-indigo-800", label: "Auto-Remediated" },
+    auto_accepted:   { cls: "bg-slate-100 text-slate-700",   label: "Auto-Accepted" },
+    clean:           { cls: "bg-green-50 text-green-700",    label: "Clean" },
+  };
+  const cfg = map[status] || { cls: "bg-slate-100 text-slate-700", label: status || "—" };
+  return `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs ${cfg.cls}">${esc(cfg.label)}</span>`;
+}
+
+function maxSeverity(row) {
+  const a = SEVERITY_ORDER[row.license_risk] || 0;
+  const b = SEVERITY_ORDER[row.security_risk] || 0;
+  return Math.max(a, b);
+}
+
+// Base64-encode a unicode string safely.
+function utf8ToBase64(str) {
+  return btoa(unescape(encodeURIComponent(str)));
+}
+
+// ============================================================================
+// API calls
+// ============================================================================
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...opts,
+  });
+  if (!res.ok) {
+    let detail = await res.text();
+    try { detail = JSON.parse(detail); } catch (e) {}
+    const err = new Error(`API ${path} failed: ${res.status}`);
+    err.status = res.status;
+    err.detail = detail;
+    throw err;
+  }
+  return res.json();
+}
+
+async function apiStartScan(body) {
+  return api("/scan/start", { method: "POST", body: JSON.stringify(body) });
+}
+async function apiStatus(jobId) { return api(`/scan/status/${jobId}`); }
+async function apiResults(jobId) { return api(`/scan/results/${jobId}`); }
+async function apiRiskMatrix(jobId) { return api(`/scan/risk-matrix/${jobId}?view=grouped`); }
+async function apiPendingReview(jobId) { return api(`/scan/pending-review/${jobId}`); }
+async function apiAuditTrail(jobId) { return api(`/audit/trail/${jobId}`); }
+async function apiVerify(jobId) { return api(`/audit/verify/${jobId}`); }
+async function apiDecision(findingId, body) {
+  return api(`/scan/decision/${findingId}`, { method: "POST", body: JSON.stringify(body) });
+}
+async function apiDemoRequirements() { return api("/demo/requirements"); }
+
+// ============================================================================
+// Header pills
+// ============================================================================
+function renderHeader() {
+  const el = document.getElementById("header-pills");
+  if (!state.currentJobId) { el.innerHTML = ""; return; }
+  const useCase = state.scanStatus?.use_case || state.useCase;
+  el.innerHTML = `
+    <span class="inline-flex items-center px-2 py-1 rounded bg-slate-100 text-slate-700 font-mono text-xs">${esc(shortJobId(state.currentJobId))}</span>
+    <span class="inline-flex items-center px-2.5 py-1 rounded bg-indigo-50 text-indigo-700 text-xs font-medium">Evaluated as: ${esc(USE_CASE_LABELS[useCase] || useCase)}</span>
+    ${statusPill(state.scanStatus?.status || "running")}`;
+}
+
+function renderFooter() {
+  const el = document.getElementById("footer-usecase");
+  if (!state.currentJobId) { el.innerHTML = ""; return; }
+  const useCase = state.scanStatus?.use_case || state.useCase;
+  el.innerHTML = `Evaluated as: <span class="font-medium text-slate-600">${esc(USE_CASE_LABELS[useCase] || useCase)}</span>`;
+}
+
+// ============================================================================
+// Section 1 — input
+// ============================================================================
+function renderInputSection() {
+  const el = document.getElementById("section-input");
+  if (state.currentJobId) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  el.classList.remove("hidden");
+
+  const fileLabel = state.uploadedFile
+    ? `<div class="mt-3 text-sm text-slate-700"><span class="font-mono">${esc(state.uploadedFile.name)}</span> · ${(state.uploadedFile.size / 1024).toFixed(1)} KB</div>`
+    : `<div class="mt-3 text-xs text-slate-400">No file selected</div>`;
+
+  const useCases = [
+    { v: "saas", label: "SaaS", desc: "Software delivered over a network" },
+    { v: "internal", label: "Internal", desc: "Internal tooling, never distributed" },
+    { v: "distributed_binary", label: "Distributed Binary", desc: "Shipped to end users as installable" },
+  ];
+  const useCaseCards = useCases.map(uc => {
+    const sel = uc.v === state.useCase;
+    return `
+      <label class="cursor-pointer border ${sel ? "border-indigo-500 ring-2 ring-indigo-500" : "border-slate-200"} rounded-lg p-4 bg-white hover:border-indigo-300 transition duration-150">
+        <input type="radio" name="use-case" value="${esc(uc.v)}" class="sr-only" ${sel ? "checked" : ""} />
+        <div class="font-medium text-slate-900">${esc(uc.label)}</div>
+        <div class="text-xs text-slate-500 mt-1">${esc(uc.desc)}</div>
+      </label>
+    `;
+  }).join("");
+
+  const canStart = !!state.uploadedContent;
+
+  el.innerHTML = `
+    <div class="fade-in max-w-2xl mx-auto bg-white border border-slate-200 rounded-xl p-8 mt-12">
+      <h1 class="text-2xl font-semibold text-slate-900">Start a compliance scan</h1>
+      <p class="text-slate-600 mt-2">Upload a <span class="font-mono text-sm">requirements.txt</span> and declare your deployment use case.</p>
+
+      <div class="mt-6">
+        <label class="block text-xs font-medium text-slate-700 mb-2">Requirements file</label>
+        <div id="drop-zone" class="border-2 border-dashed border-slate-300 rounded-lg p-6 text-center hover:border-indigo-400 transition duration-150 cursor-pointer">
+          <input id="file-input" type="file" accept=".txt" class="hidden" />
+          <div class="text-sm text-slate-600">Drop <span class="font-mono">requirements.txt</span> here or <span class="text-indigo-600 underline">click to browse</span></div>
+          ${fileLabel}
+        </div>
+      </div>
+
+      <div class="mt-6">
+        <label class="block text-xs font-medium text-slate-700 mb-2">Deployment use case</label>
+        <div class="grid grid-cols-3 gap-3">
+          ${useCaseCards}
+        </div>
+      </div>
+
+      <div class="mt-8 flex items-center gap-3">
+        <button id="btn-start" class="bg-indigo-600 text-white px-4 py-2 rounded-md text-sm font-medium hover:bg-indigo-700 active:bg-indigo-800 transition duration-150 disabled:bg-slate-300 disabled:cursor-not-allowed shadow-sm hover:shadow" ${canStart ? "" : "disabled"}>
+          Start Scan
+        </button>
+        <button id="btn-demo" class="border border-slate-300 bg-white text-slate-700 px-4 py-2 rounded-md text-sm font-medium hover:bg-slate-50 active:bg-slate-100 transition duration-150">
+          Use Demo Data
+        </button>
+        <div id="input-status" class="text-xs text-slate-500 ml-2"></div>
+      </div>
+    </div>
+  `;
+
+  document.getElementById("drop-zone").addEventListener("click", () => {
+    document.getElementById("file-input").click();
+  });
+  document.getElementById("drop-zone").addEventListener("dragover", (e) => {
+    e.preventDefault();
+    e.currentTarget.classList.add("border-indigo-400", "bg-indigo-50");
+  });
+  document.getElementById("drop-zone").addEventListener("dragleave", (e) => {
+    e.currentTarget.classList.remove("border-indigo-400", "bg-indigo-50");
+  });
+  document.getElementById("drop-zone").addEventListener("drop", (e) => {
+    e.preventDefault();
+    e.currentTarget.classList.remove("border-indigo-400", "bg-indigo-50");
+    if (e.dataTransfer.files?.[0]) handleFile(e.dataTransfer.files[0]);
+  });
+  document.getElementById("file-input").addEventListener("change", (e) => {
+    if (e.target.files?.[0]) handleFile(e.target.files[0]);
+  });
+  el.querySelectorAll('input[name="use-case"]').forEach(r => {
+    r.addEventListener("change", (e) => {
+      state.useCase = e.target.value;
+      renderInputSection();
+    });
+  });
+  document.getElementById("btn-start").addEventListener("click", startScan);
+  document.getElementById("btn-demo").addEventListener("click", loadDemo);
+}
+
+function handleFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    state.uploadedFile = { name: file.name, size: file.size };
+    state.uploadedContent = reader.result;
+    renderInputSection();
+  };
+  reader.readAsText(file);
+}
+
+async function loadDemo() {
+  setInputStatus("Loading demo data…");
+  try {
+    const data = await apiDemoRequirements();
+    state.uploadedContent = data.content;
+    state.uploadedFile = { name: data.filename, size: data.content.length };
+    setInputStatus("");
+    renderInputSection();
+  } catch (e) {
+    console.error(e);
+    setInputStatus("Failed to load demo data. " + (e.detail?.message || ""));
+  }
+}
+
+function setInputStatus(msg) { const el = document.getElementById("input-status"); if (el) el.textContent = msg; }
+
+async function startScan() {
+  if (!state.uploadedContent) return;
+  setInputStatus("Starting scan…");
+  try {
+    const body = {
+      input_type: "requirements_file",
+      input_value: utf8ToBase64(state.uploadedContent),
+      use_case: state.useCase,
+    };
+    const resp = await apiStartScan(body);
+    state.currentJobId = resp.job_id;
+    state.scanStatus = { status: resp.status, use_case: resp.use_case, current_phase: "initializing" };
+    render();
+    startPolling();
+  } catch (e) {
+    console.error(e);
+    setInputStatus("Failed to start scan: " + (e.detail?.message || e.message));
+  }
+}
+
+// ============================================================================
+// Section 2 — live progress
+// ============================================================================
+function startPolling() {
+  if (state.pollingInterval) clearInterval(state.pollingInterval);
+  state.pollingInterval = setInterval(pollStatus, 2000);
+  pollStatus();
+}
+
+function stopPolling() {
+  if (state.pollingInterval) clearInterval(state.pollingInterval);
+  state.pollingInterval = null;
+}
+
+async function pollStatus() {
+  if (!state.currentJobId) return;
+  try {
+    const s = await apiStatus(state.currentJobId);
+    state.scanStatus = s;
+    if (s.status === "complete") {
+      stopPolling();
+      await fetchCompletedData();
+    } else if (s.status === "failed") {
+      stopPolling();
+    } else if (s.status === "awaiting_human") {
+      // Pause polling but still attempt to fetch results periodically — the
+      // backend completes asynchronously after all decisions are in.
+      try {
+        await fetchCompletedData();
+        stopPolling();
+      } catch (e) {
+        // results not ready yet; fetch pending review instead
+        try {
+          state.pendingReview = await apiPendingReview(state.currentJobId);
+        } catch (e2) { /* swallow */ }
+      }
+    }
+    render();
+  } catch (e) {
+    console.warn("Status poll failed", e);
+  }
+}
+
+async function fetchCompletedData() {
+  const [results, matrix, audit] = await Promise.all([
+    apiResults(state.currentJobId),
+    apiRiskMatrix(state.currentJobId),
+    apiAuditTrail(state.currentJobId),
+  ]);
+  state.scanResults = results;
+  state.riskMatrix = matrix;
+  state.auditTrail = audit;
+}
+
+function renderProgressSection() {
+  const el = document.getElementById("section-progress");
+  const s = state.scanStatus;
+  const inProgress = state.currentJobId && s && !["complete", "failed"].includes(s.status) && !state.riskMatrix;
+  if (!inProgress) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  el.classList.remove("hidden");
+
+  const phase = PHASE_LABELS[s.current_phase] || { label: s.current_phase || "Working", icon: "•" };
+  const pct = Math.max(2, Math.min(100, s.progress_pct || 0));
+  const activity = (s.current_activity || []).slice().reverse();
+  const findings = s.findings_preview || { critical: 0, high: 0, medium: 0, low: 0, total: 0 };
+
+  const activityRows = activity.length === 0
+    ? `<div class="text-sm text-slate-400 italic py-6 text-center">Waiting for activity…</div>`
+    : activity.map(a => {
+        const ev = a.event || "checking";
+        let icon = "•", color = "text-slate-400";
+        if (ev === "cve_found")        { icon = "⚠"; color = "text-orange-600"; }
+        else if (ev === "cve_clean")   { icon = "✓"; color = "text-green-600"; }
+        else if (ev === "license_found") { icon = "§"; color = "text-blue-600"; }
+        else if (ev === "license_issue") { icon = "⚠"; color = "text-amber-600"; }
+        else if (ev === "from_cache")  { icon = "⚡"; color = "text-indigo-600"; }
+        else if (ev === "checking")    { icon = "↻"; color = "text-slate-500"; }
+        return `<div class="fade-in flex items-center gap-3 py-2 px-3 border-b border-slate-100 last:border-b-0">
+          <div class="${color} w-6 text-center text-sm">${icon}</div>
+          <div class="flex-1 min-w-0">
+            <div class="font-mono text-sm text-slate-900 truncate">${esc(a.package)}<span class="text-slate-400">==${esc(a.version)}</span></div>
+            ${a.detail ? `<div class="text-xs text-slate-600">${esc(a.detail)}</div>` : ""}
+          </div>
+          <div class="text-xs text-slate-400 font-mono whitespace-nowrap">${esc(a.timestamp ? new Date(a.timestamp).toLocaleTimeString() : "")}</div>
+        </div>`;
+      }).join("");
+
+  el.innerHTML = `
+    <div class="fade-in">
+      <div class="bg-white border border-slate-200 rounded-xl p-6 mb-4">
+        <div class="flex items-center gap-3 mb-4">
+          <div class="text-2xl">${phase.icon}</div>
+          <div>
+            <div class="text-lg font-semibold text-slate-900">${esc(phase.label)}</div>
+            <div class="text-xs text-slate-500">Scan ${esc(shortJobId(state.currentJobId))}</div>
+          </div>
+        </div>
+
+        <div class="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
+          <div class="bg-gradient-to-r from-indigo-500 to-indigo-600 h-2 transition-all duration-500" style="width:${pct}%"></div>
+        </div>
+        <div class="mt-2 text-xs text-slate-600">${esc(s.packages_analyzed || 0)} of ${esc(s.packages_total || 0)} packages analyzed</div>
+      </div>
+
+      <div class="grid grid-cols-3 gap-4 mb-4">
+        <div class="bg-white border border-slate-200 rounded-xl p-6">
+          <div class="text-xs text-slate-500 uppercase tracking-wide">Packages analyzed</div>
+          <div class="text-3xl font-semibold text-slate-900 mt-2">${esc(s.packages_analyzed || 0)}</div>
+          <div class="text-xs text-slate-400 mt-1">of ${esc(s.packages_total || 0)} resolved</div>
+        </div>
+        <div class="bg-white border border-slate-200 rounded-xl p-6">
+          <div class="text-xs text-slate-500 uppercase tracking-wide">Cache hits</div>
+          <div class="text-3xl font-semibold text-slate-900 mt-2">${esc(s.cache_hits || 0)}</div>
+          <div class="text-xs text-slate-400 mt-1">${s.packages_total ? `${Math.round(100 * (s.cache_hits || 0) / s.packages_total)}% served from cache` : "—"}</div>
+        </div>
+        <div class="bg-white border border-slate-200 rounded-xl p-6">
+          <div class="text-xs text-slate-500 uppercase tracking-wide">Findings so far</div>
+          <div class="flex items-center gap-2 mt-2">
+            ${["critical","high","medium","low"].map(k => `
+              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border ${SEV_CLASSES[k]}">${findings[k] || 0} ${k}</span>
+            `).join("")}
+          </div>
+        </div>
+      </div>
+
+      <div class="bg-white border border-slate-200 rounded-xl">
+        <div class="px-4 py-3 border-b border-slate-200 text-sm font-medium text-slate-900">Live activity</div>
+        <div class="max-h-80 overflow-y-auto">${activityRows}</div>
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================================
+// Section 3 — risk matrix
+// ============================================================================
+function renderResultsSection() {
+  const el = document.getElementById("section-results");
+  if (!state.riskMatrix) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  el.classList.remove("hidden");
+
+  const rows = state.riskMatrix.rows || [];
+  const heroFindings = collectHeroFindings();
+  const filtered = applyFilters(rows);
+
+  el.innerHTML = `
+    <div class="fade-in">
+      <div class="flex items-baseline justify-between mb-4">
+        <div>
+          <h2 class="text-2xl font-semibold text-slate-900">Risk matrix</h2>
+          <p class="text-slate-600 text-sm mt-1">${esc(state.riskMatrix.summary?.total_packages || 0)} packages scanned · ${esc(state.riskMatrix.summary?.packages_with_findings || 0)} with findings</p>
+        </div>
+        <div>${renderSummaryStats()}</div>
+      </div>
+
+      ${heroFindings.length ? `
+        <div class="mb-8">
+          <h3 class="text-sm font-semibold text-slate-700 uppercase tracking-wide mb-3">Critical findings requiring attention</h3>
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            ${heroFindings.map(renderHeroCard).join("")}
+          </div>
+        </div>
+      ` : ""}
+
+      <div class="bg-white border border-slate-200 rounded-xl overflow-hidden">
+        ${renderFilterBar()}
+        <table class="w-full text-sm">
+          <thead class="bg-slate-50 border-b border-slate-200 text-xs uppercase tracking-wide text-slate-500">
+            <tr>
+              <th class="text-left px-4 py-3 font-medium">Package</th>
+              <th class="text-left px-4 py-3 font-medium">License risk</th>
+              <th class="text-left px-4 py-3 font-medium">Security risk</th>
+              <th class="text-left px-4 py-3 font-medium">Status</th>
+              <th class="text-right px-4 py-3 font-medium">Action</th>
+            </tr>
+          </thead>
+          <tbody id="risk-tbody">
+            ${filtered.length === 0
+              ? `<tr><td colspan="5" class="px-4 py-8 text-center text-slate-400 italic">No packages match the current filters.</td></tr>`
+              : filtered.map(renderTableRow).join("")
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  // Wire up filters
+  el.querySelectorAll("[data-sev-filter]").forEach(b => {
+    b.addEventListener("click", () => {
+      const v = b.getAttribute("data-sev-filter");
+      const idx = state.filters.severity.indexOf(v);
+      if (idx >= 0) state.filters.severity.splice(idx, 1);
+      else state.filters.severity.push(v);
+      renderResultsSection();
+    });
+  });
+  el.querySelectorAll("[data-type-filter]").forEach(b => {
+    b.addEventListener("click", () => {
+      state.filters.type = b.getAttribute("data-type-filter");
+      renderResultsSection();
+    });
+  });
+  el.querySelectorAll("[data-trans-filter]").forEach(b => {
+    b.addEventListener("click", () => {
+      state.filters.transitive = b.getAttribute("data-trans-filter");
+      renderResultsSection();
+    });
+  });
+  el.querySelectorAll("[data-decision-filter]").forEach(b => {
+    b.addEventListener("click", () => {
+      state.filters.decision = b.getAttribute("data-decision-filter");
+      renderResultsSection();
+    });
+  });
+  const search = el.querySelector("#filter-search");
+  if (search) {
+    search.value = state.filters.search;
+    search.addEventListener("input", (e) => {
+      state.filters.search = e.target.value;
+      renderResultsSection();
+    });
+  }
+
+  // Wire up row clicks
+  el.querySelectorAll("[data-row-key]").forEach(tr => {
+    tr.addEventListener("click", (e) => {
+      if (e.target.closest("[data-stop-row]")) return;
+      const key = tr.getAttribute("data-row-key");
+      togglePackageRow(key);
+    });
+  });
+
+  // Wire up hero card clicks
+  el.querySelectorAll("[data-hero-finding]").forEach(card => {
+    card.addEventListener("click", () => {
+      const fid = card.getAttribute("data-hero-finding");
+      const pkg = card.getAttribute("data-hero-pkg");
+      state.expandedFindingId = fid;
+      state.scrollToFindingId = fid;
+      // Ensure that row is expanded
+      const row = (state.riskMatrix.rows || []).find(r => r.package === pkg);
+      if (row && !isPackageExpanded(rowKey(row))) {
+        state.expandedPackages = state.expandedPackages || new Set();
+        state.expandedPackages.add(rowKey(row));
+      }
+      renderResultsSection();
+      setTimeout(() => {
+        const target = document.getElementById(`finding-${fid}`);
+        if (target) target.scrollIntoView({ behavior: "smooth", block: "center" });
+      }, 50);
+    });
+  });
+
+  // Wire up decision forms
+  el.querySelectorAll("[data-decision-form]").forEach(form => wireDecisionForm(form));
+
+  // Scroll to finding if requested
+  if (state.scrollToFindingId) {
+    const t = document.getElementById(`finding-${state.scrollToFindingId}`);
+    if (t) {
+      t.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+    state.scrollToFindingId = null;
+  }
+}
+
+function rowKey(row) { return `${row.package}==${row.version}`; }
+function isPackageExpanded(key) { return state.expandedPackages && state.expandedPackages.has(key); }
+function togglePackageRow(key) {
+  state.expandedPackages = state.expandedPackages || new Set();
+  state.expandedPackages.has(key) ? state.expandedPackages.delete(key) : state.expandedPackages.add(key);
+  renderResultsSection();
+}
+
+function renderSummaryStats() {
+  const s = state.riskMatrix.summary || {};
+  return `<div class="flex items-center gap-2">
+    ${["critical", "high", "medium", "low"].map(k =>
+      `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border ${SEV_CLASSES[k]}">${s[`${k}_count`] || 0} ${k}</span>`
+    ).join("")}
+  </div>`;
+}
+
+function renderFilterBar() {
+  const sevButtons = ["critical", "high", "medium", "low", "none"].map(s => {
+    const active = state.filters.severity.includes(s);
+    return `<button data-sev-filter="${s}" class="px-2.5 py-1 rounded text-xs font-medium border ${active ? SEV_CLASSES[s] : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"} transition duration-150">${s}</button>`;
+  }).join("");
+
+  const segment = (curr, opts, attr) => opts.map(o => {
+    const active = curr === o.v;
+    return `<button data-${attr}="${o.v}" class="px-3 py-1 text-xs font-medium ${active ? "bg-slate-900 text-white" : "bg-white text-slate-600 hover:bg-slate-50"} ${o.first ? "rounded-l-md" : ""} ${o.last ? "rounded-r-md" : ""} border border-slate-200 ${o.first ? "" : "-ml-px"} transition duration-150">${o.label}</button>`;
+  }).join("");
+
+  return `
+    <div class="border-b border-slate-200 px-4 py-3 flex flex-wrap items-center gap-4">
+      <div class="flex items-center gap-1">
+        <span class="text-xs text-slate-500 mr-2">Severity</span>
+        ${sevButtons}
+      </div>
+      <div class="flex items-center">
+        <span class="text-xs text-slate-500 mr-2">Type</span>
+        ${segment(state.filters.type, [
+          { v: "all", label: "All", first: true },
+          { v: "license", label: "License" },
+          { v: "security", label: "Security", last: true },
+        ], "type-filter")}
+      </div>
+      <div class="flex items-center">
+        <span class="text-xs text-slate-500 mr-2">Scope</span>
+        ${segment(state.filters.transitive, [
+          { v: "all", label: "All", first: true },
+          { v: "direct", label: "Direct" },
+          { v: "transitive", label: "Transitive", last: true },
+        ], "trans-filter")}
+      </div>
+      <div class="flex items-center">
+        <span class="text-xs text-slate-500 mr-2">Decision</span>
+        ${segment(state.filters.decision, [
+          { v: "all", label: "All", first: true },
+          { v: "pending", label: "Pending" },
+          { v: "auto", label: "Auto" },
+          { v: "decided", label: "Decided", last: true },
+        ], "decision-filter")}
+      </div>
+      <div class="ml-auto">
+        <input id="filter-search" type="text" placeholder="Filter by package…"
+               class="px-3 py-1 text-sm border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-200 focus:border-indigo-400" />
+      </div>
+    </div>
+  `;
+}
+
+function applyFilters(rows) {
+  const f = state.filters;
+  return rows.filter(r => {
+    if (f.search && !r.package.toLowerCase().includes(f.search.toLowerCase())) return false;
+    if (f.severity.length) {
+      if (!f.severity.includes(r.license_risk) && !f.severity.includes(r.security_risk)) return false;
+    }
+    if (f.type === "license" && r.license_risk === "none") return false;
+    if (f.type === "security" && r.security_risk === "none") return false;
+    if (f.transitive === "direct" && r.transitive) return false;
+    if (f.transitive === "transitive" && !r.transitive) return false;
+    if (f.decision === "pending" && r.overall_status !== "human_review") return false;
+    if (f.decision === "auto" && !["auto_remediate", "auto_accepted"].includes(r.overall_status)) return false;
+    if (f.decision === "decided" && r.overall_status === "human_review") return false;
+    return true;
+  });
+}
+
+function collectHeroFindings() {
+  const lics = state.scanResults?.license_findings || [];
+  const cves = state.scanResults?.cve_findings || [];
+  const all = [...lics, ...cves];
+  const critical = all.filter(f => (f.severity || "").toLowerCase() === "critical");
+  const high = all.filter(f => (f.severity || "").toLowerCase() === "high");
+  const picks = critical.length >= 3 ? critical.slice(0, 4) : [...critical, ...high.slice(0, 4 - critical.length)].slice(0, 4);
+  return picks;
+}
+
+function renderHeroCard(f) {
+  const sev = (f.severity || "none").toLowerCase();
+  const type = f.finding_type === "cve" ? "CVE" : "License Violation";
+  return `<div data-hero-finding="${esc(f.finding_id)}" data-hero-pkg="${esc(f.package)}" class="cursor-pointer bg-white border border-slate-200 rounded-xl p-5 hover:shadow-md hover:border-indigo-300 transition duration-150">
+    <div class="flex items-start justify-between mb-3">
+      <div class="font-mono text-base text-slate-900 truncate"><span class="font-semibold">${esc(f.package)}</span><span class="text-slate-400">==${esc(f.version)}</span></div>
+      ${sevPill(sev)}
+    </div>
+    <div class="text-xs text-slate-500 mb-1">${esc(type)}</div>
+    <div class="text-sm text-slate-700 line-clamp-3">${esc((f.description || "").slice(0, 160))}${(f.description || "").length > 160 ? "…" : ""}</div>
+    <div class="flex items-center justify-end mt-3 text-xs text-indigo-600">
+      Click to review →
+    </div>
+  </div>`;
+}
+
+function renderTableRow(row) {
+  const key = rowKey(row);
+  const expanded = isPackageExpanded(key);
+  const transIcon = row.transitive
+    ? `<span class="ml-2 text-slate-400" title="Transitive dependency">🔗</span>`
+    : `<span class="ml-2 text-slate-400" title="Direct dependency">📦</span>`;
+  const fixBadge = row.has_fix_available
+    ? `<span class="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-50 text-green-700">FIX AVAILABLE</span>`
+    : "";
+  const action = row.overall_status === "human_review"
+    ? `<span class="text-indigo-600 font-medium">Review →</span>`
+    : (row.finding_count > 0
+       ? `<span class="text-slate-600">View Details</span>`
+       : `<span class="text-green-700">✓ Clean</span>`);
+  const main = `
+    <tr data-row-key="${esc(key)}" class="border-b border-slate-100 hover:bg-slate-50 cursor-pointer transition duration-150 ${expanded ? "bg-slate-50" : ""}">
+      <td class="px-4 py-3">
+        <div class="flex items-center font-mono text-sm">
+          <span class="text-slate-900">${esc(row.package)}</span><span class="text-slate-400">==${esc(row.version)}</span>${transIcon}${fixBadge}
+        </div>
+      </td>
+      <td class="px-4 py-3">${sevPill(row.license_risk)}</td>
+      <td class="px-4 py-3">${sevPill(row.security_risk)}</td>
+      <td class="px-4 py-3">${overallStatusPill(row.overall_status)}</td>
+      <td class="px-4 py-3 text-right text-sm">${action}</td>
+    </tr>
+  `;
+  if (!expanded) return main;
+  return main + renderExpandedRow(row);
+}
+
+function renderExpandedRow(row) {
+  const findings = findingsForRow(row);
+  const inner = findings.length === 0
+    ? `<div class="text-sm text-slate-500 italic">No findings — package is clean. ${row.dependency_chain && row.dependency_chain.length ? "" : ""}</div>${renderDependencyChain(row)}`
+    : findings.map(f => renderFindingDetail(f, row)).join('<div class="my-6 border-t border-slate-200"></div>');
+
+  return `
+    <tr>
+      <td colspan="5" class="p-0 bg-slate-50 border-b border-slate-200">
+        <div class="border-l-4 border-indigo-400 p-6">
+          ${inner}
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
+function findingsForRow(row) {
+  const all = [...(state.scanResults?.license_findings || []), ...(state.scanResults?.cve_findings || [])];
+  return all.filter(f => f.package === row.package && f.version === row.version);
+}
+
+function renderDependencyChain(row) {
+  const chain = row.dependency_chain || [];
+  if (chain.length === 0) {
+    return `<div class="mb-6">
+      <h4 class="text-xs uppercase tracking-wide text-slate-500 mb-2">Dependency chain</h4>
+      <div class="text-sm text-slate-700">📦 Direct dependency — listed in <span class="font-mono">requirements.txt</span></div>
+    </div>`;
+  }
+  const segments = [...chain, row.package].map((name, i, arr) => {
+    const isLast = i === arr.length - 1;
+    return `<span class="inline-flex items-center px-3 py-1 rounded bg-slate-200 ${isLast ? "bg-indigo-100 text-indigo-900 font-medium" : "text-slate-700"} font-mono text-xs">${esc(name)}</span>${!isLast ? `<span class="mx-2 text-slate-400">→</span>` : ""}`;
+  }).join("");
+  return `<div class="mb-6">
+    <h4 class="text-xs uppercase tracking-wide text-slate-500 mb-2">Dependency chain</h4>
+    <div class="flex items-center flex-wrap">${segments}</div>
+    <div class="mt-2 text-xs text-slate-500">🔗 Transitive — pulled in by <span class="font-mono">${esc(chain[0])}</span></div>
+  </div>`;
+}
+
+function renderFindingDetail(f, row) {
+  const sev = (f.severity || "none").toLowerCase();
+  const type = f.finding_type === "cve" ? "CVE" : (f.finding_type || "Finding").replace(/_/g, " ");
+  const pending = (f.decision_status || "").toLowerCase() === "human_review";
+  const decided = ["accepted", "deferred", "auto_remediate"].includes((f.decision_status || "").toLowerCase());
+
+  return `
+    <div id="finding-${esc(f.finding_id)}" class="space-y-6">
+      <!-- Section A: header -->
+      <div>
+        <div class="flex items-center gap-3 mb-2">
+          ${sevPill(sev, "text-sm px-2.5 py-1")}
+          <span class="text-xs uppercase tracking-wide text-slate-500">${esc(type)}</span>
+          <span class="font-mono text-xs text-slate-400">${esc(f.finding_id)}</span>
+        </div>
+        <p class="text-sm text-slate-700 leading-relaxed">${esc(f.description || "")}</p>
+        ${f.recommendation ? `<p class="text-sm text-slate-600 mt-2"><span class="font-medium">Recommendation:</span> ${esc(f.recommendation)}</p>` : ""}
+      </div>
+
+      <!-- Section B: dependency chain (only on first finding for the row) -->
+      ${renderDependencyChain(row)}
+
+      <!-- Section C: citations -->
+      <div>
+        <h4 class="text-xs uppercase tracking-wide text-slate-500 mb-2">Evidence (${(f.citations || []).length} citations)</h4>
+        <div class="space-y-2">
+          ${(f.citations || []).map(renderCitationCard).join("") || `<div class="text-sm italic text-slate-400">No citations recorded.</div>`}
+        </div>
+      </div>
+
+      <!-- Section D: remediation -->
+      ${(f.remediations || []).length ? `
+        <div>
+          <h4 class="text-xs uppercase tracking-wide text-slate-500 mb-2">Recommended actions</h4>
+          <div class="space-y-3">
+            ${(f.remediations || []).map((r, i) => renderRemediationCard(r, i === 0)).join("")}
+          </div>
+        </div>
+      ` : ""}
+
+      <!-- Section E: prior decision -->
+      ${f.prior_decision ? renderPriorDecisionCallout(f, f.prior_decision) : ""}
+
+      <!-- Section F: decision form -->
+      ${decided
+        ? renderDecisionResult(f)
+        : (pending ? renderDecisionForm(f) : "")
+      }
+
+      <!-- Section G: audit metadata -->
+      <div class="text-xs text-slate-400 font-mono pt-2 border-t border-slate-200">
+        ID ${esc(f.finding_id)} · Use case ${esc(f.use_case || row.use_case || "—")} · ${f.decided_at ? `Decided ${esc(fmtDate(f.decided_at))}` : `Created ${esc(fmtDate(state.scanResults?.scanned_at))}`}
+      </div>
+    </div>
+  `;
+}
+
+function renderCitationCard(c) {
+  const isLLM = (c.source || "").toLowerCase() === "llm_inference";
+  const isNone = (c.source || "").toLowerCase() === "none_found";
+  const borderCls = isLLM ? "border-yellow-300 bg-yellow-50" : (isNone ? "border-slate-200 bg-slate-50" : "border-slate-200 bg-white");
+  return `<div class="border ${borderCls} rounded-md p-3 text-sm">
+    <div class="flex items-center justify-between mb-1 flex-wrap gap-2">
+      <div class="flex items-center gap-2">
+        ${citationBadge(c.source)}
+        ${c.identifier ? `<span class="font-mono text-xs text-slate-700">${esc(c.identifier)}</span>` : ""}
+      </div>
+      ${c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noopener" class="text-xs text-indigo-600 hover:underline inline-flex items-center gap-1">link <span aria-hidden="true">↗</span></a>` : ""}
+    </div>
+    ${c.excerpt ? `<div class="italic text-slate-700">"${esc(c.excerpt)}"</div>` : ""}
+    ${isNone ? `<div class="text-xs text-slate-500 mt-1">No evidence retrieved — finding requires human review.</div>` : ""}
+    <div class="text-xs text-slate-400 mt-1">Retrieved: ${esc(fmtDate(c.retrieved_at))}</div>
+  </div>`;
+}
+
+function renderRemediationCard(r, isRecommended) {
+  const typeLabel = ((r.type || "") + "").replace(/_/g, " ");
+  const target = r.target_version
+    ? (r.target_package
+       ? `<div class="font-mono text-sm mt-2"><span class="text-slate-500">Swap to:</span> ${esc(r.target_package)}==${esc(r.target_version)}</div>`
+       : `<div class="font-mono text-sm mt-2"><span class="text-slate-500">Upgrade to:</span> ${esc(r.target_version)}</div>`)
+    : "";
+  const citations = (r.citations || []).slice(0, 4)
+    .map(c => citationBadge(c.source)).join(" ");
+  return `<div class="border ${isRecommended ? "border-indigo-300 bg-indigo-50/40" : "border-slate-200 bg-white"} rounded-md p-4">
+    <div class="flex items-center justify-between mb-2">
+      <div class="flex items-center gap-2">
+        <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-700 capitalize">${esc(typeLabel)}</span>
+        ${isRecommended ? `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-indigo-100 text-indigo-700">RECOMMENDED</span>` : ""}
+      </div>
+      ${r.confidence ? `<span class="text-xs text-slate-400">confidence: ${esc(r.confidence)}</span>` : ""}
+    </div>
+    <div class="text-sm text-slate-700">${esc(r.description || "")}</div>
+    ${target}
+    ${r.tradeoffs ? `<div class="text-xs italic text-slate-600 mt-2">${esc(r.tradeoffs)}</div>` : ""}
+    ${citations ? `<div class="mt-3 flex gap-1 flex-wrap">${citations}</div>` : ""}
+  </div>`;
+}
+
+function renderPriorDecisionCallout(f, prior) {
+  const mode = prior.l2_mode || "";
+  return `<div class="border border-amber-300 bg-amber-50 rounded-md p-4 text-sm">
+    <div class="font-medium text-amber-900 mb-1">Prior decision on file</div>
+    <div class="text-amber-900">
+      This finding was reviewed on <span class="font-mono">${esc(fmtDate(prior.decided_at))}</span>
+      by <span class="font-mono">${esc(prior.decided_by || "—")}</span>.
+      Previous decision: <span class="font-medium uppercase">${esc(prior.decision_status || "")}</span>.
+    </div>
+    ${prior.rationale ? `<div class="mt-2 text-amber-800 italic">"${esc(prior.rationale)}"</div>` : ""}
+    ${mode === "show_for_confirmation"
+      ? `<button data-confirm-prior="${esc(f.finding_id)}" data-prior-rationale="${esc(prior.rationale || "")}" class="mt-3 inline-flex items-center px-3 py-1.5 rounded-md bg-amber-600 text-white text-xs font-medium hover:bg-amber-700 transition duration-150">Confirm Previous Decision</button>`
+      : ""}
+    ${mode === "always_resurface"
+      ? `<div class="mt-3 inline-flex items-center px-2 py-0.5 rounded bg-red-100 text-red-800 text-xs font-medium">Re-review required</div>`
+      : ""}
+  </div>`;
+}
+
+function renderDecisionResult(f) {
+  const cls = {
+    accepted: "bg-green-50 border-green-200 text-green-900",
+    deferred: "bg-amber-50 border-amber-200 text-amber-900",
+    auto_remediate: "bg-indigo-50 border-indigo-200 text-indigo-900",
+  }[(f.decision_status || "").toLowerCase()] || "bg-slate-50 border-slate-200 text-slate-700";
+  return `<div class="border ${cls} rounded-md p-4 text-sm">
+    <div class="font-medium uppercase text-xs tracking-wide mb-1">Decision: ${esc(f.decision_status)}</div>
+    <div>Decided by <span class="font-mono">${esc(f.decided_by || "—")}</span> on ${esc(fmtDate(f.decided_at))}</div>
+    ${f.decision_rationale ? `<div class="mt-2 italic">"${esc(f.decision_rationale)}"</div>` : ""}
+  </div>`;
+}
+
+function renderDecisionForm(f) {
+  const draft = state.decisionDrafts[f.finding_id] || { status: "accepted", rationale: "", decided_by: "demo@signedoff.test" };
+  const submitting = !!state.decisionSubmitting[f.finding_id];
+  return `<div data-decision-form="${esc(f.finding_id)}" class="border border-slate-200 rounded-md p-4 bg-white">
+    <h4 class="text-xs uppercase tracking-wide text-slate-500 mb-3">Submit decision</h4>
+    <div class="grid grid-cols-3 gap-2 mb-3">
+      ${[
+        { v: "accepted", label: "Accept", desc: "Risk accepted with rationale" },
+        { v: "deferred", label: "Defer", desc: "Revisit later, logged" },
+        { v: "auto_remediate", label: "Auto-Remediate", desc: "Apply recommended fix" },
+      ].map(opt => `
+        <label class="cursor-pointer block border ${draft.status === opt.v ? "border-indigo-500 ring-2 ring-indigo-500" : "border-slate-200"} rounded-md p-3 hover:border-indigo-300 transition duration-150">
+          <input type="radio" name="status-${esc(f.finding_id)}" value="${esc(opt.v)}" class="sr-only" ${draft.status === opt.v ? "checked" : ""} />
+          <div class="text-sm font-medium text-slate-900">${esc(opt.label)}</div>
+          <div class="text-xs text-slate-500 mt-0.5">${esc(opt.desc)}</div>
+        </label>
+      `).join("")}
+    </div>
+    <textarea name="rationale-${esc(f.finding_id)}" rows="3" placeholder="Rationale (required for Accept/Defer)" class="w-full text-sm border border-slate-200 rounded-md p-2 focus:outline-none focus:ring-2 focus:ring-indigo-200 focus:border-indigo-400">${esc(draft.rationale)}</textarea>
+    <div class="mt-3 flex items-center gap-3">
+      <input type="text" name="decided-by-${esc(f.finding_id)}" value="${esc(draft.decided_by)}" placeholder="decided_by" class="flex-1 text-sm border border-slate-200 rounded-md px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-200 focus:border-indigo-400" />
+      <button type="button" data-submit-decision="${esc(f.finding_id)}" ${submitting ? "disabled" : ""} class="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700 disabled:bg-slate-300 transition duration-150 shadow-sm">
+        ${submitting ? `<span class="spinner"></span>` : ""}
+        Submit Decision
+      </button>
+    </div>
+    <div data-decision-error="${esc(f.finding_id)}" class="mt-2 text-xs text-red-700"></div>
+  </div>`;
+}
+
+function wireDecisionForm(form) {
+  const fid = form.getAttribute("data-decision-form");
+  state.decisionDrafts[fid] = state.decisionDrafts[fid] || { status: "accepted", rationale: "", decided_by: "demo@signedoff.test" };
+  form.querySelectorAll(`input[name="status-${fid}"]`).forEach(r => {
+    r.addEventListener("change", (e) => {
+      state.decisionDrafts[fid].status = e.target.value;
+      renderResultsSection();
+    });
+  });
+  form.querySelector(`textarea[name="rationale-${fid}"]`)?.addEventListener("input", (e) => {
+    state.decisionDrafts[fid].rationale = e.target.value;
+  });
+  form.querySelector(`input[name="decided-by-${fid}"]`)?.addEventListener("input", (e) => {
+    state.decisionDrafts[fid].decided_by = e.target.value;
+  });
+  form.querySelector(`[data-submit-decision="${fid}"]`)?.addEventListener("click", () => submitDecision(fid));
+  // confirm prior decision
+  form.parentElement?.querySelectorAll(`[data-confirm-prior]`).forEach(b => {
+    b.addEventListener("click", () => {
+      const rationale = b.getAttribute("data-prior-rationale") || "Confirmed previous decision";
+      state.decisionDrafts[fid] = { status: "accepted", rationale, decided_by: "demo@signedoff.test" };
+      submitDecision(fid);
+    });
+  });
+}
+
+async function submitDecision(findingId) {
+  const draft = state.decisionDrafts[findingId];
+  if (!draft) return;
+  const errEl = document.querySelector(`[data-decision-error="${findingId}"]`);
+  if (errEl) errEl.textContent = "";
+  if (["accepted", "deferred"].includes(draft.status) && !draft.rationale.trim()) {
+    if (errEl) errEl.textContent = "Rationale is required for accept/defer.";
+    return;
+  }
+  if (!draft.decided_by.trim()) {
+    if (errEl) errEl.textContent = "decided_by is required.";
+    return;
+  }
+  state.decisionSubmitting[findingId] = true;
+  renderResultsSection();
+  try {
+    await apiDecision(findingId, {
+      job_id: state.currentJobId,
+      decision_status: draft.status,
+      rationale: draft.rationale || null,
+      decided_by: draft.decided_by,
+    });
+    state.decisionSubmitting[findingId] = false;
+    delete state.decisionDrafts[findingId];
+    // Refresh results
+    try {
+      await fetchCompletedData();
+    } catch (e) {
+      // results not ready yet — refresh status
+      await pollStatus();
+    }
+    render();
+  } catch (e) {
+    state.decisionSubmitting[findingId] = false;
+    const msg = e.detail?.detail?.message || e.detail?.message || e.message;
+    if (errEl) errEl.textContent = `Failed: ${msg}`;
+    renderResultsSection();
+  }
+}
+
+// ============================================================================
+// Section 4 — audit trail
+// ============================================================================
+function renderAuditSection() {
+  const el = document.getElementById("section-audit");
+  if (!state.auditTrail) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  el.classList.remove("hidden");
+
+  const audit = state.auditTrail;
+  const expanded = state.auditExpanded;
+  const verify = state.verifyResult;
+
+  const verifyBanner = verify ? renderVerifyBanner(verify) : "";
+
+  el.innerHTML = `
+    <div class="fade-in bg-white border border-slate-200 rounded-xl overflow-hidden">
+      <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between cursor-pointer" id="audit-header">
+        <div class="flex items-center gap-3">
+          <span class="text-slate-400 transition-transform duration-150 ${expanded ? "rotate-90" : ""}">▶</span>
+          <div>
+            <div class="text-base font-semibold text-slate-900">Audit Trail</div>
+            <div class="text-xs text-slate-500">${esc(audit.entry_count)} entries · Chain ${audit.chain_valid ? `<span class="inline-flex items-center gap-1 text-green-700">✓ valid</span>` : `<span class="inline-flex items-center gap-1 text-red-700">✕ invalid</span>`}</div>
+          </div>
+        </div>
+        <button id="btn-verify" data-stop-row class="${state.verifyingChain ? "bg-indigo-400 cursor-wait" : "bg-indigo-600 hover:bg-indigo-700"} text-white px-4 py-2 rounded-md text-sm font-medium transition duration-150 inline-flex items-center gap-2 shadow-sm">
+          ${state.verifyingChain ? `<span class="spinner"></span> Verifying…` : "Verify Chain Now"}
+        </button>
+      </div>
+
+      ${verifyBanner ? `<div class="px-6 pt-4">${verifyBanner}</div>` : ""}
+
+      ${expanded ? `
+        <div class="divide-y divide-slate-100">
+          ${(audit.entries || []).map(renderAuditEntry).join("")}
+        </div>
+      ` : ""}
+    </div>
+  `;
+
+  document.getElementById("audit-header").addEventListener("click", (e) => {
+    if (e.target.closest("#btn-verify")) return;
+    state.auditExpanded = !state.auditExpanded;
+    renderAuditSection();
+  });
+  document.getElementById("btn-verify").addEventListener("click", verifyChain);
+}
+
+function renderVerifyBanner(v) {
+  if (v.verdict === "PASS") {
+    return `<div class="verify-reveal bg-gradient-to-r from-green-50 to-green-100 border border-green-200 rounded-md p-4 flex items-center gap-3">
+      <div class="text-green-700 text-2xl">✓</div>
+      <div class="flex-1">
+        <div class="font-semibold text-green-900">Chain verified</div>
+        <div class="text-sm text-green-800">${esc(v.entries_verified)} entries · No tampering detected</div>
+      </div>
+      <div class="text-xs text-green-700 font-mono">Verified ${esc(fmtDate(v.verified_at))}</div>
+    </div>`;
+  }
+  return `<div class="verify-reveal bg-red-50 border border-red-300 rounded-md p-4">
+    <div class="flex items-center gap-3 mb-2">
+      <div class="text-red-700 text-2xl">✕</div>
+      <div class="flex-1">
+        <div class="font-semibold text-red-900">Chain integrity check FAILED</div>
+        <div class="text-sm text-red-800">${v.broken_at_seq !== null ? `Tampering detected at sequence ${esc(v.broken_at_seq)}` : "Chain inconsistent"}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderAuditEntry(entry) {
+  const payload = entry.payload || {};
+  const preview = Object.entries(payload).slice(0, 3).map(([k, v]) => {
+    let val = typeof v === "string" ? v : JSON.stringify(v);
+    if (val && val.length > 40) val = val.slice(0, 40) + "…";
+    return `<span class="text-slate-500">${esc(k)}=</span><span class="text-slate-700">${esc(val)}</span>`;
+  }).join(" · ");
+  return `<div class="px-6 py-3 flex items-start gap-4 text-sm">
+    <div class="font-mono text-xs text-slate-400 w-10 text-right">#${esc(entry.seq)}</div>
+    <div class="font-mono text-xs text-slate-400 w-44 truncate">${esc(fmtDate(entry.timestamp))}</div>
+    <div class="w-44">
+      <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-700">${esc(entry.event_type)}</span>
+    </div>
+    <div class="flex-1 text-xs truncate">${preview}</div>
+    <div class="font-mono text-xs text-slate-300 whitespace-nowrap">${esc((entry.entry_hash || "").slice(0, 8))}</div>
+  </div>`;
+}
+
+async function verifyChain() {
+  if (state.verifyingChain) return;
+  state.verifyingChain = true;
+  state.verifyResult = null;
+  renderAuditSection();
+  const start = Date.now();
+  try {
+    const v = await apiVerify(state.currentJobId);
+    const elapsed = Date.now() - start;
+    if (elapsed < 500) await new Promise(r => setTimeout(r, 500 - elapsed));
+    state.verifyResult = v;
+  } catch (e) {
+    console.error(e);
+    state.verifyResult = { verdict: "FAIL", broken_at_seq: null, entries_verified: 0, verified_at: new Date().toISOString() };
+  } finally {
+    state.verifyingChain = false;
+    renderAuditSection();
+  }
+}
+
+// ============================================================================
+// Render orchestrator
+// ============================================================================
+function render() {
+  renderHeader();
+  renderFooter();
+  renderInputSection();
+  renderProgressSection();
+  renderResultsSection();
+  renderAuditSection();
+}
+
+document.addEventListener("DOMContentLoaded", render);
+</script>
+</body>
+</html>
