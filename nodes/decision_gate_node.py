@@ -63,8 +63,23 @@ async def decision_gate_node(state: AgentState) -> dict:
     if not pending:
         return {}
 
-    # Pause the pipeline. The API resumes by passing a decisions list as
-    # the interrupt's return value via graph.aupdate_state(...).
+    # Capture the canonical Finding lists BEFORE the interrupt — the
+    # mutations below apply to the same dict objects referenced from
+    # these lists, but LangGraph requires the fields to appear in this
+    # node's return dict for the mutations to survive checkpoint
+    # serialization. (Same pattern as risk_node, fixed in d1c71f8: the
+    # in-place mutation works in-process but loses on persistence
+    # unless the field is in the return.) Without this, the user-
+    # visible /scan/results read from state["cve_findings"] /
+    # state["license_findings"] keeps showing decision_status =
+    # "human_review" + decided_by = None forever, even though
+    # resolved_findings correctly reflects the decision and
+    # pending_human_review correctly shrinks.
+    license_findings: list[Finding] = list(state.get("license_findings") or [])
+    cve_findings: list[Finding] = list(state.get("cve_findings") or [])
+
+    # Pause the pipeline. The API resumes by passing a decisions list
+    # via graph.ainvoke(Command(resume=decisions), config).
     decisions = interrupt({"pending_findings": pending})
     decisions = list(decisions or [])
 
@@ -72,6 +87,21 @@ async def decision_gate_node(state: AgentState) -> dict:
     still_pending: list[Finding] = list(pending)
     errors: list[str] = []
     now = _now_iso()
+
+    # LangGraph's checkpointer deserializes state into independent dict
+    # objects per field. The `pending` dict for finding f-X is NOT the
+    # same Python object as `cve_findings[i]` for the same finding —
+    # they're independent copies of the same data. Mutating one does
+    # not propagate to the other. So we collect the user-provided
+    # updates ONCE and apply them in lockstep to every list that holds
+    # a copy of the finding (still_pending, the canonical
+    # license_findings / cve_findings lists, and the resolved list).
+    def _apply_to_first_match(lst: list[Finding], fid: str, updates: dict) -> bool:
+        for f in lst:
+            if f.get("finding_id") == fid:
+                f.update(updates)
+                return True
+        return False
 
     for decision in decisions:
         finding_id = decision.get("finding_id")
@@ -92,10 +122,22 @@ async def decision_gate_node(state: AgentState) -> dict:
             )
             continue
 
-        finding["decision_status"] = decision_status
-        finding["decision_rationale"] = decision.get("rationale")
-        finding["decided_at"] = now
-        finding["decided_by"] = decision.get("decided_by")
+        updates = {
+            "decision_status": decision_status,
+            "decision_rationale": decision.get("rationale"),
+            "decided_at": now,
+            "decided_by": decision.get("decided_by"),
+        }
+        finding.update(updates)
+
+        # Mirror the update onto the canonical Finding-list copies so
+        # the post-checkpoint state agrees across resolved_findings,
+        # license_findings, and cve_findings. _apply_to_first_match is
+        # tolerant: it's expected to be a no-op on the list that doesn't
+        # contain this finding (e.g. a license decision skips the
+        # cve_findings list and vice versa).
+        _apply_to_first_match(license_findings, finding_id, updates)
+        _apply_to_first_match(cve_findings, finding_id, updates)
 
         resolved.append(finding)
         still_pending = [
@@ -155,6 +197,14 @@ async def decision_gate_node(state: AgentState) -> dict:
     return {
         "resolved_findings": resolved,
         "pending_human_review": still_pending,
+        # license_findings and cve_findings hold the SAME mutated Finding
+        # dict references as `resolved`, but unlike resolved_findings (which
+        # has operator.add reducer + is in the return), these fields need
+        # to be explicitly emitted here so LangGraph's checkpoint replaces
+        # state's frozen copy. See top-of-function comment for the
+        # canonical bug-pattern reference.
+        "license_findings": license_findings,
+        "cve_findings": cve_findings,
         "audit_events": [audit_event],
         "errors": errors,
     }

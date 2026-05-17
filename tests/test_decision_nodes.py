@@ -298,3 +298,166 @@ def test_auto_accept_no_qualifying_findings_returns_empty_dict():
     ]
     result = _run(auto_accept_node(_state(resolved_findings=findings)))
     assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Decision persistence on canonical license_findings / cve_findings lists
+# (regression for the dashboard-blocking bug where /scan/results kept
+# reporting decided findings as decision_status="human_review", because
+# decision_gate_node mutated dicts in place but didn't return the
+# license_findings / cve_findings lists. LangGraph's checkpointer
+# deserializes state into independent dict copies per field, so the
+# mutation only stuck on the resolved_findings list that was emitted in
+# the return.)
+# ---------------------------------------------------------------------------
+
+def test_cve_decision_propagates_to_returned_cve_findings():
+    """A user-submitted decision on a CVE finding must appear on the
+    returned cve_findings list (the canonical source /scan/results reads
+    from), not just on resolved_findings."""
+    cve = _finding(finding_id="f-cve-1", finding_type="cve",
+                   package="django", version="4.2.3")
+    decisions = [{
+        "finding_id": "f-cve-1", "decision_status": "accepted",
+        "rationale": "Vulnerable path not reachable in our deployment.",
+        "decided_by": "kaden@test.com",
+    }]
+    state = _state(
+        pending_human_review=[cve],
+        cve_findings=[cve],
+        license_findings=[],
+    )
+    with patch("nodes.decision_gate_node.interrupt", return_value=decisions):
+        result = _run(decision_gate_node(state))
+
+    assert "cve_findings" in result, (
+        "decision_gate_node must include cve_findings in its return so the "
+        "decision_status mutation survives LangGraph checkpoint serialization."
+    )
+    cve_out = result["cve_findings"][0]
+    assert cve_out["finding_id"] == "f-cve-1"
+    assert cve_out["decision_status"] == "accepted"
+    assert cve_out["decided_by"] == "kaden@test.com"
+    assert cve_out["decision_rationale"].startswith("Vulnerable path")
+    assert cve_out["decided_at"] is not None
+
+
+def test_license_decision_propagates_to_returned_license_findings():
+    """Same persistence contract on the license branch — proves the fix
+    isn't CVE-specific and locks in the symmetry."""
+    lic = _finding(finding_id="f-lic-1", finding_type="license_violation",
+                   package="mysqlclient", version="2.1.1")
+    decisions = [{
+        "finding_id": "f-lic-1", "decision_status": "deferred",
+        "rationale": "Pending legal review next sprint.",
+        "decided_by": "legal@test.com",
+    }]
+    state = _state(
+        pending_human_review=[lic],
+        license_findings=[lic],
+        cve_findings=[],
+    )
+    with patch("nodes.decision_gate_node.interrupt", return_value=decisions):
+        result = _run(decision_gate_node(state))
+
+    assert "license_findings" in result
+    lic_out = result["license_findings"][0]
+    assert lic_out["finding_id"] == "f-lic-1"
+    assert lic_out["decision_status"] == "deferred"
+    assert lic_out["decided_by"] == "legal@test.com"
+    assert lic_out["decision_rationale"].startswith("Pending legal review")
+
+
+def test_partial_decision_keeps_remaining_findings_pending():
+    """Submit one decision among three pending — the other two must
+    still be in pending_human_review (so route_to_audit loops back to
+    decision_gate_node and the chain does NOT seal early). Also
+    verifies the not-yet-decided findings keep their original
+    decision_status (no spurious mutation)."""
+    f1 = _finding(finding_id="f-1", finding_type="cve")
+    f2 = _finding(finding_id="f-2", finding_type="cve")
+    f3 = _finding(finding_id="f-3", finding_type="cve")
+    pending = [f1, f2, f3]
+    decisions = [{
+        "finding_id": "f-1", "decision_status": "accepted",
+        "rationale": "x" * 20, "decided_by": "k@x",
+    }]
+    state = _state(
+        pending_human_review=pending,
+        cve_findings=list(pending),
+        license_findings=[],
+    )
+    with patch("nodes.decision_gate_node.interrupt", return_value=decisions):
+        result = _run(decision_gate_node(state))
+
+    # f-1 resolved.
+    assert len(result["resolved_findings"]) == 1
+    assert result["resolved_findings"][0]["finding_id"] == "f-1"
+    # f-2 and f-3 still pending — graph must re-interrupt, not seal.
+    pending_ids = {f["finding_id"] for f in result["pending_human_review"]}
+    assert pending_ids == {"f-2", "f-3"}
+
+    # Canonical cve_findings list reflects: f-1 accepted, f-2 / f-3
+    # untouched (decision_status still HUMAN_REVIEW, decided_by still None).
+    by_id = {f["finding_id"]: f for f in result["cve_findings"]}
+    assert by_id["f-1"]["decision_status"] == "accepted"
+    assert by_id["f-1"]["decided_by"] == "k@x"
+    assert by_id["f-2"]["decision_status"] == DecisionStatus.HUMAN_REVIEW
+    assert by_id["f-2"]["decided_by"] is None
+    assert by_id["f-3"]["decision_status"] == DecisionStatus.HUMAN_REVIEW
+    assert by_id["f-3"]["decided_by"] is None
+
+
+def test_sequential_decisions_eventually_drain_pending():
+    """Three sequential single-decision calls drain pending_human_review
+    to empty across the calls. Each call mirrors what
+    POST /scan/decision does for one finding. The final call leaves
+    pending empty — only then would route_to_audit advance to audit_node
+    and seal the chain."""
+    f1 = _finding(finding_id="f-1", finding_type="cve")
+    f2 = _finding(finding_id="f-2", finding_type="cve")
+    f3 = _finding(finding_id="f-3", finding_type="cve")
+    pending = [f1, f2, f3]
+    cve_list = list(pending)
+
+    # Call #1: decide f-1
+    with patch("nodes.decision_gate_node.interrupt", return_value=[{
+        "finding_id": "f-1", "decision_status": "accepted",
+        "rationale": "ok-1-ok-1-ok-1", "decided_by": "k@x",
+    }]):
+        r1 = _run(decision_gate_node(_state(
+            pending_human_review=pending, cve_findings=cve_list,
+            license_findings=[],
+        )))
+    assert len(r1["pending_human_review"]) == 2
+
+    # Call #2: decide f-2 from the (new) pending list returned by call #1.
+    with patch("nodes.decision_gate_node.interrupt", return_value=[{
+        "finding_id": "f-2", "decision_status": "deferred",
+        "rationale": "ok-2-ok-2-ok-2", "decided_by": "k@x",
+    }]):
+        r2 = _run(decision_gate_node(_state(
+            pending_human_review=r1["pending_human_review"],
+            cve_findings=r1["cve_findings"],
+            license_findings=[],
+        )))
+    assert len(r2["pending_human_review"]) == 1
+
+    # Call #3: decide f-3, the last one.
+    with patch("nodes.decision_gate_node.interrupt", return_value=[{
+        "finding_id": "f-3", "decision_status": "auto_remediate",
+        "rationale": None, "decided_by": "k@x",
+    }]):
+        r3 = _run(decision_gate_node(_state(
+            pending_human_review=r2["pending_human_review"],
+            cve_findings=r2["cve_findings"],
+            license_findings=[],
+        )))
+
+    # NOW pending is empty — graph would route to audit_node and seal.
+    assert r3["pending_human_review"] == []
+    # All three findings show their final decision_status in cve_findings.
+    by_id = {f["finding_id"]: f for f in r3["cve_findings"]}
+    assert by_id["f-1"]["decision_status"] == "accepted"
+    assert by_id["f-2"]["decision_status"] == "deferred"
+    assert by_id["f-3"]["decision_status"] == "auto_remediate"
