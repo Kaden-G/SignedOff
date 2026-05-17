@@ -239,7 +239,23 @@ def build_graph() -> StateGraph:
     builder.add_node("sbom_node",           sbom_node)
     builder.add_node("license_node",        license_node)
     builder.add_node("cve_node",            cve_node)
-    builder.add_node("risk_node",           risk_node)
+    # defer=True on risk_node enforces the join after the parallel
+    # license_node + cve_node fan-out. Without this, LangGraph's
+    # fan-in semantics could schedule risk_node as soon as either
+    # predecessor completes — and if license_node finishes first,
+    # risk_node would build the risk matrix from license findings
+    # alone, populate pending_human_review, flip status to
+    # "awaiting_human", and trigger the HITL interrupt BEFORE cve_node
+    # has merged its findings. The DecisionGate would then serve a
+    # partial state to the API (license-only matrix, security_risk=NONE
+    # on every package).
+    #
+    # `defer=True` tells the Pregel runtime to wait until every other
+    # task that can still reach this node in the current super-step
+    # has completed, then run risk_node exactly once with the merged
+    # state. This is the architectural "merge then route" contract
+    # promised in DESIGN.md.
+    builder.add_node("risk_node",           risk_node, defer=True)
     builder.add_node("decision_gate_node",  decision_gate_node)
     builder.add_node("auto_remediate_node", auto_remediate_node)
     builder.add_node("auto_accept_node",    auto_accept_node)
