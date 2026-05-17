@@ -348,29 +348,30 @@ async def get_status(job_id: str):
 
 @app.get("/scan/results/{job_id}")
 async def get_results(job_id: str):
+    """
+    Return the analysis snapshot for a scan.
+
+    Idempotent across lifecycle: the same URL works whether the scan
+    is mid-flight, paused at the HITL gate, or complete. The response
+    `scan_status` field tells the UI which state the data represents.
+    """
     if job_id not in _job_metadata:
         raise _err(404, "job_not_found", f"No scan job found with id {job_id}")
 
     report = get_report(job_id)
     if report:
-        return report
+        return {**report, "scan_status": "complete"}
 
-    # No stored report yet — figure out whether the scan is still running
-    # (409) or completed-but-missing-report (500).
+    # No stored report yet — serve a partial view from live graph state.
     config = make_config(job_id)
     state = await graph.aget_state(config)
-    current_status = (
-        state.values.get("status", "running") if state and state.values else "running"
+    values = (state.values if state else None) or {}
+    meta = _job_metadata[job_id]
+    partial = _synthesize_report_from_state(
+        values, job_id, fallback_use_case=meta.get("use_case"),
     )
-    if current_status != "complete":
-        progress = _compute_progress(state.values) if state and state.values else 0
-        raise _err(
-            409, "scan_in_progress",
-            "Scan is still running. Poll /scan/status/{job_id} for progress.",
-            status=current_status, progress_pct=progress,
-        )
-    raise _err(500, "report_not_generated",
-               "Scan completed but no report was stored.")
+    partial["scan_status"] = values.get("status") or meta.get("status", "running")
+    return partial
 
 
 # ---------------------------------------------------------------------------
@@ -382,14 +383,89 @@ async def get_risk_matrix(
     job_id: str,
     view: Literal["grouped", "flat"] = Query("grouped"),
 ):
-    report = get_report(job_id)
-    if not report:
-        raise _err(404, "results_not_ready",
-                   f"No completed report for {job_id}; check /scan/status first")
+    """
+    Return the risk matrix (grouped per-package or flat per-finding).
 
-    if view == "flat":
-        return _build_flat_view(report)
-    return _build_grouped_view(report)
+    Idempotent across lifecycle: when the scan is mid-flight or paused
+    at the HITL gate, this serves a partial view synthesized from live
+    graph state. When the scan is complete, it serves from the stored
+    report. The response `scan_status` field tells the UI which state
+    the data represents.
+    """
+    if job_id not in _job_metadata:
+        raise _err(404, "job_not_found", f"No scan job found with id {job_id}")
+
+    report = get_report(job_id)
+    if report:
+        source = report
+        scan_status = "complete"
+    else:
+        config = make_config(job_id)
+        state = await graph.aget_state(config)
+        values = (state.values if state else None) or {}
+        meta = _job_metadata[job_id]
+        source = _synthesize_report_from_state(
+            values, job_id, fallback_use_case=meta.get("use_case"),
+        )
+        scan_status = values.get("status") or meta.get("status", "running")
+
+    result = _build_flat_view(source) if view == "flat" else _build_grouped_view(source)
+    result["scan_status"] = scan_status
+    return result
+
+
+def _synthesize_report_from_state(
+    values: dict,
+    job_id: str,
+    fallback_use_case: Optional[str] = None,
+) -> dict:
+    """
+    Build a report-shaped dict from live graph state so the grouped/flat
+    view helpers and `/scan/results` can serve the same response shape
+    regardless of whether the scan is mid-flight or complete.
+
+    Mirrors the field set produced by nodes/report_node.py — packages,
+    license_findings, cve_findings, raw_dependency_tree, use_case,
+    job_id, scanned_at, summary, executive_summary.
+
+    Missing fields are filled defensively: empty lists for collections,
+    None for optional scalars, _job_metadata fallback for use_case when
+    SBOMNode hasn't written to state yet.
+    """
+    license_findings = list(values.get("license_findings") or [])
+    cve_findings = list(values.get("cve_findings") or [])
+    all_findings = license_findings + cve_findings
+    packages = list(values.get("packages") or [])
+
+    sev_counts: dict[str, int] = {
+        level: 0 for level in ("critical", "high", "medium", "low", "none")
+    }
+    for f in all_findings:
+        sev = _enum_or_str(f.get("severity"))
+        if sev in sev_counts:
+            sev_counts[sev] += 1
+
+    summary = {
+        "packages_total": len(packages),
+        "packages_direct": sum(1 for p in packages if not p.get("transitive")),
+        "packages_transitive": sum(1 for p in packages if p.get("transitive")),
+        "cache_hits": sum(1 for p in packages if p.get("from_cache")),
+        "findings_total": len(all_findings),
+        "findings_by_severity": sev_counts,
+    }
+
+    return {
+        "job_id": job_id,
+        "use_case": values.get("use_case") or fallback_use_case,
+        "scanned_at": values.get("started_at"),
+        "completed_at": values.get("completed_at"),
+        "summary": summary,
+        "executive_summary": values.get("risk_summary"),
+        "packages": packages,
+        "license_findings": license_findings,
+        "cve_findings": cve_findings,
+        "raw_dependency_tree": values.get("raw_dependency_tree") or {},
+    }
 
 
 def _build_dependency_chains(raw_tree) -> dict[str, list[str]]:

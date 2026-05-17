@@ -231,8 +231,22 @@ RESPONSE 404 Not Found:
 # =============================================================================
 # GET /scan/results/{job_id}
 # =============================================================================
-# Full findings detail. Fetch once when status = "complete".
-# Returns all packages, all findings (license + CVE), executive summary.
+# Idempotent across the scan lifecycle. Serves partial analysis data when
+# the scan is mid-flight or paused at the HITL gate, final data once the
+# scan completes. Same URL works in all three states — the UI doesn't
+# need to know which state it's in to call the endpoint.
+#
+# The response carries a `scan_status` field mirroring /scan/status so
+# the UI can label the view as partial if needed:
+#   - "running"        → packages and findings analyzed so far
+#   - "awaiting_human" → all analysis done; some findings need decisions
+#   - "complete"       → final stored report (audit trail sealed, summary set)
+#   - "failed"         → see errors[]
+#
+# For partial views (scan_status != "complete"):
+#   - packages[], license_findings[], cve_findings[] reflect work so far
+#   - executive_summary / completed_at may be null (set on completion)
+#   - dependency_chain populates normally for any package already analyzed
 #
 # Ashu mock: use the seeded findings from demo_requirements.txt.
 # -----------------------------------------------------------------------------
@@ -244,6 +258,11 @@ REQUEST:
 RESPONSE 200 OK:
     {
       "job_id": "job-8f2c1a9b-...",
+
+      "scan_status": "complete",
+        # Same vocabulary as /scan/status. Tells the UI whether this is
+        # a final report or a partial mid-scan snapshot.
+        # Values: "running" | "awaiting_human" | "complete" | "failed"
 
       "use_case": "saas",
         # Echoed. This is the context under which ALL findings were evaluated.
@@ -486,13 +505,10 @@ RESPONSE 200 OK:
 RESPONSE 404 Not Found:
     { "error": "job_not_found", "message": "No scan job found with id ..." }
 
-RESPONSE 409 Conflict (scan not yet complete):
-    {
-      "error": "scan_in_progress",
-      "message": "Scan is still running. Poll /scan/status/{job_id} for progress.",
-      "status": "running",
-      "progress_pct": 42
-    }
+# Note: prior versions returned 409 "scan_in_progress" mid-scan. That
+# behavior is removed — the endpoint now serves a partial view from
+# live graph state and tags it with scan_status != "complete". 404 is
+# only returned when job_id is genuinely unknown.
 
 
 # =============================================================================
@@ -507,6 +523,20 @@ RESPONSE 409 Conflict (scan not yet complete):
 #                            → drives the findings inbox / list view
 #
 # Both shapes echo use_case at the top level AND per-row for auditability.
+#
+# IDEMPOTENT ACROSS LIFECYCLE: same as /scan/results, this endpoint
+# serves a partial view synthesized from live graph state when scan is
+# "running" or "awaiting_human", and a final view from the stored
+# report when "complete". The response carries a `scan_status` field
+# (same vocabulary as /scan/status) so the UI can label partial data
+# accordingly.
+#
+# For partial views (scan_status != "complete"):
+#   - rows[] / findings[] reflect packages and findings analyzed so far
+#   - dependency_chain is populated normally
+#   - contextualized_severity / contextualization_rationale appear
+#     for any HIGH/CRITICAL CVE finding that RiskNode has already
+#     processed
 # -----------------------------------------------------------------------------
 
 REQUEST:
@@ -518,6 +548,8 @@ REQUEST:
 RESPONSE 200 OK — ?view=grouped:
     {
       "job_id": "job-8f2c1a9b-...",
+      "scan_status": "complete",
+        # "running" | "awaiting_human" | "complete" | "failed"
       "use_case": "saas",
         # Echoed. This is the lens through which ALL risk was evaluated.
         # Frontend: show as a badge/pill near the table header.
@@ -621,6 +653,8 @@ RESPONSE 200 OK — ?view=grouped:
 RESPONSE 200 OK — ?view=flat:
     {
       "job_id": "job-8f2c1a9b-...",
+      "scan_status": "complete",
+        # "running" | "awaiting_human" | "complete" | "failed"
       "use_case": "saas",
       "scanned_at": "2026-05-13T14:32:00Z",
 

@@ -134,15 +134,26 @@ def test_get_status_running_job_echoes_use_case(client):
 # GET /scan/results
 # ---------------------------------------------------------------------------
 
-def test_get_results_running_scan_returns_409_scan_in_progress(client):
+def test_get_results_running_scan_returns_200_with_partial_data(client):
+    """
+    Mid-scan, the endpoint serves a partial view from live graph state.
+    The legacy 409 "scan_in_progress" behavior was a UX bug — the data
+    is already in state["packages"]/["license_findings"]/["cve_findings"]
+    and the UI can render it while polling for completion.
+    """
     _seed_job("job-running")
-    state_values = {"status": "running", "packages": []}
+    state_values = {"status": "running", "packages": [], "use_case": "saas"}
     with _patch_graph(values=state_values):
         resp = client.get("/scan/results/job-running")
-    assert resp.status_code == 409
-    detail = resp.json()["detail"]
-    assert detail["error"] == "scan_in_progress"
-    assert detail["status"] == "running"
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["scan_status"] == "running"
+    assert body["job_id"] == "job-running"
+    assert body["use_case"] == "saas"
+    # Partial view: collections present and empty, not missing.
+    assert body["packages"] == []
+    assert body["license_findings"] == []
+    assert body["cve_findings"] == []
 
 
 def test_get_results_completed_returns_stored_report(client):
@@ -164,7 +175,10 @@ def test_get_results_completed_returns_stored_report(client):
     with _patch_graph():
         resp = client.get("/scan/results/job-done")
     assert resp.status_code == 200
-    assert resp.json()["use_case"] == "internal"
+    body = resp.json()
+    assert body["use_case"] == "internal"
+    # Completed reports get scan_status="complete" stamped on response.
+    assert body["scan_status"] == "complete"
 
 
 # ---------------------------------------------------------------------------
@@ -704,6 +718,144 @@ def test_pending_review_includes_dependency_chain_on_each_finding(client):
     assert findings["f-lic-textunidecode"]["dependency_chain"] == [
         "factory-boy", "faker"
     ]
+
+
+# ---------------------------------------------------------------------------
+# Partial views mid-scan — /scan/risk-matrix and /scan/results
+# (regression: previously these returned 404/409 when no completed
+# report existed; now they fall back to live graph state)
+# ---------------------------------------------------------------------------
+
+def _mid_scan_state_values(use_case: str = "saas") -> dict:
+    """Realistic live-state snapshot with one CVE finding already produced."""
+    return {
+        "use_case": use_case,
+        "status": "awaiting_human",
+        "started_at": "2026-05-17T10:00:00Z",
+        "packages": [
+            {"name": "django", "version": "4.2.3", "transitive": False,
+             "from_cache": False, "license": "BSD-3-Clause",
+             "license_status": "compliant",
+             "license_risk": RiskLevel.NONE, "security_risk": RiskLevel.CRITICAL,
+             "cves": [], "cached_at": None},
+        ],
+        "cve_findings": [{
+            "finding_id": "f-mid-1",
+            "package": "django",
+            "version": "4.2.3",
+            "finding_type": "cve",
+            "severity": RiskLevel.CRITICAL,
+            "description": "SQL injection",
+            "recommendation": "Upgrade",
+            "decision_status": DecisionStatus.HUMAN_REVIEW,
+            "remediations": [{
+                "type": "version_bump",
+                "target_version": "4.2.14",
+                "target_package": None,
+                "confidence": "high",
+                "rationale": "patched",
+                "tradeoffs": None,
+                "citations": [],
+            }],
+            "citations": [{"source": "osv", "url": "https://osv.dev/x",
+                           "identifier": "GHSA-x", "excerpt": "x",
+                           "retrieved_at": "x", "confidence": "x",
+                           "validated": True, "validation_method": "x",
+                           "content_hash": "x"}],
+        }],
+        "license_findings": [],
+        "raw_dependency_tree": {"tree": []},
+        "pending_human_review": [],
+        "resolved_findings": [],
+    }
+
+
+def test_risk_matrix_returns_200_with_partial_data_when_running(client):
+    _seed_job("job-running-rm", use_case="saas")
+    values = _mid_scan_state_values()
+    values["status"] = "running"
+    with _patch_graph(values=values):
+        resp = client.get("/scan/risk-matrix/job-running-rm?view=grouped")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["scan_status"] == "running"
+    assert body["use_case"] == "saas"
+    # The mid-scan finding shows up in the grouped rows.
+    rows_by_pkg = {r["package"]: r for r in body["rows"]}
+    assert "django" in rows_by_pkg
+    assert rows_by_pkg["django"]["security_risk"] == "critical"
+
+
+def test_risk_matrix_returns_200_with_partial_data_when_awaiting_human(client):
+    _seed_job("job-hitl-rm", use_case="saas")
+    with _patch_graph(values=_mid_scan_state_values()):
+        resp = client.get("/scan/risk-matrix/job-hitl-rm?view=grouped")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["scan_status"] == "awaiting_human"
+    assert any(r["package"] == "django" for r in body["rows"])
+
+
+def test_risk_matrix_flat_view_also_works_mid_scan(client):
+    _seed_job("job-flat-mid", use_case="saas")
+    with _patch_graph(values=_mid_scan_state_values()):
+        resp = client.get("/scan/risk-matrix/job-flat-mid?view=flat")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["scan_status"] == "awaiting_human"
+    assert any(f["finding_id"] == "f-mid-1" for f in body["findings"])
+
+
+def test_risk_matrix_completed_response_carries_scan_status_complete(client):
+    """The complete-report path must also tag the response with scan_status."""
+    _seed_completed_report()
+    with _patch_graph():
+        resp = client.get("/scan/risk-matrix/job-rm?view=grouped")
+    assert resp.status_code == 200
+    assert resp.json()["scan_status"] == "complete"
+
+
+def test_results_returns_200_with_partial_data_when_awaiting_human(client):
+    _seed_job("job-hitl-results", use_case="saas")
+    with _patch_graph(values=_mid_scan_state_values()):
+        resp = client.get("/scan/results/job-hitl-results")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["scan_status"] == "awaiting_human"
+    assert body["use_case"] == "saas"
+    # The mid-scan finding is in the response.
+    assert any(f["finding_id"] == "f-mid-1" for f in body["cve_findings"])
+    # Summary echoes what's analyzed so far.
+    assert body["summary"]["findings_total"] == 1
+
+
+def test_risk_matrix_404_only_when_job_genuinely_unknown(client):
+    """job_id absent from _job_metadata → 404. job_id present but no
+    report and empty state → still 200 partial view (the job exists)."""
+    # Genuinely unknown job → 404
+    with _patch_graph():
+        resp = client.get("/scan/risk-matrix/job-never-existed?view=grouped")
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"] == "job_not_found"
+
+    # Job exists in metadata but graph hasn't produced state yet → 200
+    # with empty partial view.
+    _seed_job("job-empty", use_case="saas")
+    with _patch_graph(values={}):
+        resp = client.get("/scan/risk-matrix/job-empty?view=grouped")
+    assert resp.status_code == 200
+    body = resp.json()
+    # Falls back to metadata for status + use_case.
+    assert body["use_case"] == "saas"
+    assert body["scan_status"] in ("running", "awaiting_human")
+    assert body["rows"] == []
+
+
+def test_results_404_only_when_job_genuinely_unknown(client):
+    with _patch_graph():
+        resp = client.get("/scan/results/job-never-existed")
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"] == "job_not_found"
 
 
 # ---------------------------------------------------------------------------
