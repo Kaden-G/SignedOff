@@ -49,6 +49,16 @@
   </div>
 </footer>
 
+<!-- Back-to-top affordance. Hidden by default; scroll listener flips it on
+     once the user has scrolled past ~200px so it doesn't crowd the input
+     screen. -->
+<button id="back-to-top"
+        aria-label="Back to top"
+        class="fixed bottom-6 right-6 z-50 bg-indigo-600 text-white px-4 py-2 rounded-full shadow-lg hover:bg-indigo-700 transition-opacity duration-150 opacity-0 pointer-events-none"
+        type="button">
+  ↑ Back to top
+</button>
+
 <script>
 "use strict";
 
@@ -640,6 +650,33 @@ function renderResultsSection() {
     });
   });
 
+  // "← Back to summary" link inside expanded rows — jump to the hero cards
+  el.querySelectorAll("[data-back-to-summary]").forEach(link => {
+    link.addEventListener("click", (e) => {
+      e.preventDefault();
+      // Anchor: the first hero card if present, otherwise the results
+      // section heading.
+      const hero = el.querySelector("[data-hero-finding]");
+      const target = hero || el.querySelector("h2") || el;
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  });
+
+  // "↑ Collapse" link inside expanded rows — close the expansion and
+  // bring the table row back into view so the user doesn't lose their place.
+  el.querySelectorAll("[data-collapse-row]").forEach(link => {
+    link.addEventListener("click", (e) => {
+      e.preventDefault();
+      const key = link.getAttribute("data-collapse-row");
+      togglePackageRow(key);
+      // After re-render, scroll the now-collapsed row back into view.
+      setTimeout(() => {
+        const tr = document.querySelector(`[data-row-key="${key}"]`);
+        if (tr) tr.scrollIntoView({ behavior: "smooth", block: "center" });
+      }, 50);
+    });
+  });
+
   // Wire up hero card clicks
   el.querySelectorAll("[data-hero-finding]").forEach(card => {
     card.addEventListener("click", () => {
@@ -825,15 +862,25 @@ function renderTableRow(row) {
 
 function renderExpandedRow(row) {
   const findings = findingsForRow(row);
+  const key = rowKey(row);
   const inner = findings.length === 0
     ? `<div class="text-sm text-slate-500 italic">No findings — package is clean. ${row.dependency_chain && row.dependency_chain.length ? "" : ""}</div>${renderDependencyChain(row)}`
     : findings.map(f => renderFindingDetail(f, row)).join('<div class="my-6 border-t border-slate-200"></div>');
 
+  // Navigation aids inside the expanded panel:
+  //   - top:    "Back to summary" jumps the viewport to the hero cards
+  //   - bottom: "Collapse" closes the row and scrolls it back into view
   return `
     <tr>
       <td colspan="6" class="p-0 bg-slate-50 border-b border-slate-200">
         <div class="border-l-4 border-indigo-400 p-6">
+          <div class="flex justify-end mb-4">
+            <a href="#" data-back-to-summary class="text-xs text-indigo-600 hover:underline">← Back to summary</a>
+          </div>
           ${inner}
+          <div class="mt-6 pt-4 border-t border-slate-200 flex justify-end">
+            <a href="#" data-collapse-row="${esc(key)}" class="text-sm text-indigo-600 hover:underline">↑ Collapse</a>
+          </div>
         </div>
       </td>
     </tr>
@@ -1158,8 +1205,26 @@ function renderAuditSection() {
   const audit = state.auditTrail;
   const expanded = state.auditExpanded;
   const verify = state.verifyResult;
+  const sealStatus = audit.seal_status || (audit.chain_valid !== null ? "complete" : "pending");
+  const isPending = sealStatus === "pending";
 
   const verifyBanner = verify ? renderVerifyBanner(verify) : "";
+
+  // Pre-seal: header shows pending events count; Verify button is disabled
+  // (the chain doesn't exist yet). Sealed: existing behavior.
+  const headerSubtext = isPending
+    ? `${esc(audit.entry_count)} pending event${audit.entry_count === 1 ? "" : "s"} · <span class="text-amber-700">⌛ Chain not yet sealed</span>`
+    : `${esc(audit.entry_count)} entries sealed · Chain ${audit.chain_valid
+        ? `<span class="inline-flex items-center gap-1 text-green-700">✓ valid</span>`
+        : `<span class="inline-flex items-center gap-1 text-red-700">✕ invalid</span>`}`;
+
+  const verifyBtn = isPending
+    ? `<button id="btn-verify" data-stop-row disabled class="bg-slate-200 text-slate-500 cursor-not-allowed px-4 py-2 rounded-md text-sm font-medium inline-flex items-center gap-2" title="Chain seals at scan completion">
+         Chain seals at scan completion
+       </button>`
+    : `<button id="btn-verify" data-stop-row class="${state.verifyingChain ? "bg-indigo-400 cursor-wait" : "bg-indigo-600 hover:bg-indigo-700"} text-white px-4 py-2 rounded-md text-sm font-medium transition duration-150 inline-flex items-center gap-2 shadow-sm">
+         ${state.verifyingChain ? `<span class="spinner"></span> Verifying…` : "Verify Chain Now"}
+       </button>`;
 
   el.innerHTML = `
     <div class="fade-in bg-white border border-slate-200 rounded-xl overflow-hidden">
@@ -1168,19 +1233,17 @@ function renderAuditSection() {
           <span class="text-slate-400 transition-transform duration-150 ${expanded ? "rotate-90" : ""}">▶</span>
           <div>
             <div class="text-base font-semibold text-slate-900">Audit Trail</div>
-            <div class="text-xs text-slate-500">${esc(audit.entry_count)} entries · Chain ${audit.chain_valid ? `<span class="inline-flex items-center gap-1 text-green-700">✓ valid</span>` : `<span class="inline-flex items-center gap-1 text-red-700">✕ invalid</span>`}</div>
+            <div class="text-xs text-slate-500">${headerSubtext}</div>
           </div>
         </div>
-        <button id="btn-verify" data-stop-row class="${state.verifyingChain ? "bg-indigo-400 cursor-wait" : "bg-indigo-600 hover:bg-indigo-700"} text-white px-4 py-2 rounded-md text-sm font-medium transition duration-150 inline-flex items-center gap-2 shadow-sm">
-          ${state.verifyingChain ? `<span class="spinner"></span> Verifying…` : "Verify Chain Now"}
-        </button>
+        ${verifyBtn}
       </div>
 
       ${verifyBanner ? `<div class="px-6 pt-4">${verifyBanner}</div>` : ""}
 
       ${expanded ? `
         <div class="divide-y divide-slate-100">
-          ${(audit.entries || []).map(renderAuditEntry).join("")}
+          ${(audit.entries || []).map(e => renderAuditEntry(e, isPending)).join("")}
         </div>
       ` : ""}
     </div>
@@ -1191,7 +1254,8 @@ function renderAuditSection() {
     state.auditExpanded = !state.auditExpanded;
     renderAuditSection();
   });
-  document.getElementById("btn-verify").addEventListener("click", verifyChain);
+  const btn = document.getElementById("btn-verify");
+  if (btn && !isPending) btn.addEventListener("click", verifyChain);
 }
 
 function renderVerifyBanner(v) {
@@ -1216,13 +1280,18 @@ function renderVerifyBanner(v) {
   </div>`;
 }
 
-function renderAuditEntry(entry) {
+function renderAuditEntry(entry, isPending = false) {
   const payload = entry.payload || {};
   const preview = Object.entries(payload).slice(0, 3).map(([k, v]) => {
     let val = typeof v === "string" ? v : JSON.stringify(v);
     if (val && val.length > 40) val = val.slice(0, 40) + "…";
     return `<span class="text-slate-500">${esc(k)}=</span><span class="text-slate-700">${esc(val)}</span>`;
   }).join(" · ");
+  // Pending events have placeholder hashes — surface that explicitly
+  // rather than rendering the literal "PENDING-not-yet-sealed" string.
+  const hashCell = isPending
+    ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-900 border border-amber-200">pending seal</span>`
+    : `<span class="font-mono text-xs text-slate-300 whitespace-nowrap">${esc((entry.entry_hash || "").slice(0, 8))}</span>`;
   return `<div class="px-6 py-3 flex items-start gap-4 text-sm">
     <div class="font-mono text-xs text-slate-400 w-10 text-right">#${esc(entry.seq)}</div>
     <div class="font-mono text-xs text-slate-400 w-44 truncate">${esc(fmtDate(entry.timestamp))}</div>
@@ -1230,7 +1299,7 @@ function renderAuditEntry(entry) {
       <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-700">${esc(entry.event_type)}</span>
     </div>
     <div class="flex-1 text-xs truncate">${preview}</div>
-    <div class="font-mono text-xs text-slate-300 whitespace-nowrap">${esc((entry.entry_hash || "").slice(0, 8))}</div>
+    ${hashCell}
   </div>`;
 }
 
@@ -1266,7 +1335,32 @@ function render() {
   renderAuditSection();
 }
 
-document.addEventListener("DOMContentLoaded", render);
+// Back-to-top affordance: fade in once the user scrolls past 200px; click
+// smooth-scrolls to the top. Kept outside renderAuditSection / renderResults
+// because it's a global aid that persists across re-renders.
+function _wireBackToTop() {
+  const btn = document.getElementById("back-to-top");
+  if (!btn) return;
+  const update = () => {
+    if (window.scrollY >= 200) {
+      btn.classList.remove("opacity-0", "pointer-events-none");
+      btn.classList.add("opacity-100");
+    } else {
+      btn.classList.add("opacity-0", "pointer-events-none");
+      btn.classList.remove("opacity-100");
+    }
+  };
+  window.addEventListener("scroll", update, { passive: true });
+  btn.addEventListener("click", () => {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
+  update();
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  render();
+  _wireBackToTop();
+});
 </script>
 </body>
 </html>

@@ -167,31 +167,98 @@ def _count_severity_preview(findings: list) -> dict:
     return counts
 
 
-def _derive_overall_status(findings: list) -> str:
-    if not findings:
-        return "clean"
-    statuses = {_enum_or_str(f.get("decision_status")) for f in findings}
+def _derive_overall_status(
+    findings: list,
+    license_risk: str = "none",
+    security_risk: str = "none",
+) -> str:
+    """
+    Compute a per-package overall status from BOTH risk dimensions and
+    the findings' decision_status values.
+
+    A row with security_risk="critical" + finding_count=61 must never
+    render as "clean" just because the findings' decision_status field
+    happens to be unset or unrecognized. The fix surfaces the row as
+    "human_review" any time it has non-clean risk dimensions OR
+    findings whose status couldn't be classified as a known resolved
+    state.
+
+    Rule order (first match wins):
+      1. Any HITL finding             → "human_review"
+      2. All findings resolved        → "auto_remediate" / "auto_accepted" / "deferred"
+      3. No findings AND both dims    → "clean"
+         risks are "none"
+      4. Defensive default            → "human_review"
+         (findings with unknown status, or no findings but non-clean
+         risk dimensions — these need eyes on them)
+    """
+    statuses = {_enum_or_str(f.get("decision_status")) for f in (findings or [])}
+
+    # Rule 1: HITL wins regardless of any other signal.
     if "human_review" in statuses:
         return "human_review"
-    if "auto_remediate" in statuses:
-        return "auto_remediate"
-    if "accepted" in statuses or "deferred" in statuses:
-        return "auto_accepted"
-    return "clean"
+
+    # Rule 2: all findings have a terminal non-human status.
+    resolved_set = {"auto_remediate", "accepted", "deferred"}
+    if findings and statuses.issubset(resolved_set):
+        if "auto_remediate" in statuses:
+            return "auto_remediate"
+        if "accepted" in statuses:
+            return "auto_accepted"
+        return "deferred"
+
+    # Rule 3: truly clean — no findings AND both risk dimensions are none.
+    if not findings and license_risk == "none" and security_risk == "none":
+        return "clean"
+
+    # Rule 4: defensive — findings exist with unrecognized statuses, OR
+    # findings empty but a risk dimension is populated. Either way, the
+    # row needs a human looking at it.
+    return "human_review"
 
 
-def _derive_action_label(findings: list, license_risk: str, security_risk: str) -> str:
-    if not findings:
+def _derive_action_label(
+    findings: list,
+    license_risk: str,
+    security_risk: str,
+    overall_status: Optional[str] = None,
+) -> str:
+    """
+    Surface the action affordance for the row. Drives the right-hand
+    Action column in the risk-matrix table.
+
+    Counts are included in the human_review label so the demo can show
+    "Review 61 CVEs" instead of a generic "Review CVEs" — the count is
+    what makes the urgency obvious at a glance.
+    """
+    if overall_status == "clean":
         return "Clean"
+    if overall_status in ("auto_remediate", "auto_accepted", "deferred"):
+        return "Resolved"
+
+    findings = findings or []
     has_license = any("license" in str(f.get("finding_type", "")) for f in findings)
     has_cve = any(str(f.get("finding_type", "")).startswith("cve") for f in findings)
+    n = len(findings)
+
     if has_license and has_cve:
-        return "Two-track review"
+        return f"Review {n} findings" if n else "Two-track review"
     if has_license:
         if license_risk in ("critical", "high"):
             return "Replace Package"
         return "Review License"
-    return "Review CVEs"
+    if has_cve:
+        return f"Review {n} CVE{'s' if n != 1 else ''}"
+
+    # No findings classified — but overall_status said human_review,
+    # which only happens when a risk dimension is populated.
+    if license_risk != "none" and security_risk != "none":
+        return "Two-track review"
+    if license_risk != "none":
+        return "Review License"
+    if security_risk != "none":
+        return "Review CVEs"
+    return "Review"
 
 
 def _has_fix(finding: dict) -> bool:
@@ -542,6 +609,9 @@ def _build_grouped_view(report: dict) -> dict:
         license_risk = _enum_or_str(pkg.get("license_risk"), "none")
         security_risk = _enum_or_str(pkg.get("security_risk"), "none")
         ctx_sev, ctx_rationale = _pick_max_contextualized(pkg_findings)
+        overall_status = _derive_overall_status(
+            pkg_findings, license_risk, security_risk
+        )
         rows.append({
             "package": pkg["name"],
             "version": pkg["version"],
@@ -549,10 +619,12 @@ def _build_grouped_view(report: dict) -> dict:
             "use_case": use_case,
             "license_risk": license_risk,
             "security_risk": security_risk,
-            "overall_status": _derive_overall_status(pkg_findings),
+            "overall_status": overall_status,
             "finding_count": len(pkg_findings),
             "finding_ids": [f["finding_id"] for f in pkg_findings],
-            "action_label": _derive_action_label(pkg_findings, license_risk, security_risk),
+            "action_label": _derive_action_label(
+                pkg_findings, license_risk, security_risk, overall_status
+            ),
             "has_fix_available": any(_has_fix(f) for f in pkg_findings),
             "dependency_chain": chains.get(pkg["name"].lower(), []),
             "contextualized_severity": ctx_sev,
@@ -732,25 +804,78 @@ async def submit_decision(finding_id: str, body: DecisionRequest):
 # GET /audit/trail/{job_id}
 # ---------------------------------------------------------------------------
 
+def _wrap_pending_audit_events(events: list) -> list[dict]:
+    """
+    Decorate in-flight audit_events (accumulated by nodes during the
+    scan but not yet hash-chained by AuditNode) with placeholder
+    chain fields and a pending_seal marker. The placeholders are NOT
+    real hashes — they're typographically distinct ("PENDING-...") so
+    no consumer can mistake them for sealed entries.
+
+    AuditNode runs as the terminal step at scan completion; it sorts
+    audit_events by timestamp and writes the canonical hash-chained
+    audit_trail. Until then, /audit/trail surfaces these pending
+    events so the dashboard can show activity accumulating live —
+    a much better demo than "0 entries · No tampering detected".
+    """
+    wrapped: list[dict] = []
+    for i, ev in enumerate(events or []):
+        if not isinstance(ev, dict):
+            continue
+        wrapped.append({
+            "seq": i,
+            "timestamp": ev.get("timestamp"),
+            "event_type": ev.get("event_type"),
+            "payload": ev.get("payload") or {},
+            "prev_hash": "PENDING-not-yet-sealed",
+            "entry_hash": "PENDING-not-yet-sealed",
+            "seal_status": "pending",
+        })
+    return wrapped
+
+
 @app.get("/audit/trail/{job_id}")
 async def get_audit_trail(job_id: str):
+    """
+    Idempotent across the scan lifecycle.
+
+    - seal_status="complete": entries[] is the canonical hash-chained
+      audit_trail sealed by AuditNode at scan completion. chain_valid
+      reflects a real chain verification.
+    - seal_status="pending": entries[] is synthesized from the
+      in-flight audit_events list that nodes have accumulated so far.
+      prev_hash / entry_hash are PENDING placeholders. AuditNode has
+      not yet run, so no real chain exists to verify.
+    """
     if job_id not in _job_metadata:
         raise _err(404, "job_not_found", f"No scan job found with id {job_id}")
 
     config = make_config(job_id)
     state = await graph.aget_state(config)
-    if not state or not state.values:
-        raise _err(404, "job_not_found", f"No graph state for {job_id}")
+    values = (state.values if state else None) or {}
 
-    audit_trail = state.values.get("audit_trail") or []
-    verification = verify_chain(audit_trail)
+    audit_trail = values.get("audit_trail") or []
+    if audit_trail:
+        verification = verify_chain(audit_trail)
+        return {
+            "job_id": job_id,
+            "use_case": values.get("use_case") or _job_metadata[job_id]["use_case"],
+            "seal_status": "complete",
+            "entry_count": len(audit_trail),
+            "chain_valid": verification["chain_valid"],
+            "entries": audit_trail,
+        }
 
+    # Pre-seal: surface the in-flight events so the dashboard can show
+    # what's accumulating. No real chain to verify yet.
+    pending = values.get("audit_events") or []
     return {
         "job_id": job_id,
-        "use_case": state.values.get("use_case") or _job_metadata[job_id]["use_case"],
-        "entry_count": len(audit_trail),
-        "chain_valid": verification["chain_valid"],
-        "entries": audit_trail,
+        "use_case": values.get("use_case") or _job_metadata[job_id]["use_case"],
+        "seal_status": "pending",
+        "entry_count": len(pending),
+        "chain_valid": None,
+        "entries": _wrap_pending_audit_events(pending),
     }
 
 
@@ -760,20 +885,50 @@ async def get_audit_trail(job_id: str):
 
 @app.get("/audit/verify/{job_id}")
 async def verify_audit(job_id: str):
+    """
+    Independent chain verification.
+
+    Pre-seal (AuditNode hasn't run yet) returns seal_status="pending"
+    with chain_valid=null and an explanatory message — there is no
+    chain to verify yet, only in-flight audit_events. The UI should
+    surface this as "chain seals at scan completion" rather than
+    rendering a misleading "0 entries verified · No tampering".
+    """
     if job_id not in _job_metadata:
         raise _err(404, "job_not_found", f"No scan job found with id {job_id}")
 
     config = make_config(job_id)
     state = await graph.aget_state(config)
-    if not state or not state.values:
-        raise _err(404, "job_not_found", f"No graph state for {job_id}")
+    values = (state.values if state else None) or {}
 
-    audit_trail = state.values.get("audit_trail") or []
+    audit_trail = values.get("audit_trail") or []
+    if not audit_trail:
+        pending_count = len(values.get("audit_events") or [])
+        return {
+            "job_id": job_id,
+            "verified_at": _now_iso(),
+            "seal_status": "pending",
+            "chain_valid": None,
+            "broken_at_seq": None,
+            "citation_hashes_valid": None,
+            "citation_hash_mismatches": [],
+            "entries_verified": 0,
+            "citations_verified": 0,
+            "verdict": "PENDING",
+            "pending_entries": pending_count,
+            "message": (
+                "Chain not yet sealed. "
+                f"{pending_count} event{'s' if pending_count != 1 else ''} "
+                "accumulated during scan, awaiting sealing by AuditNode "
+                "at completion. Submit decisions to advance the scan."
+            ),
+        }
+
     result = verify_chain(audit_trail)
-
     return {
         "job_id": job_id,
         "verified_at": _now_iso(),
+        "seal_status": "complete",
         "chain_valid": result["chain_valid"],
         "broken_at_seq": result["broken_at_seq"],
         # v1: per-citation hash verification not separately implemented;

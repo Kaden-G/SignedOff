@@ -859,6 +859,170 @@ def test_results_404_only_when_job_genuinely_unknown(client):
 
 
 # ---------------------------------------------------------------------------
+# overall_status / action_label derivation
+# (regression: previously "clean" + "View Details" for a package with
+# security_risk="critical" + 61 findings whose decision_status was set
+# to HUMAN_REVIEW)
+# ---------------------------------------------------------------------------
+
+def test_overall_status_human_review_when_cve_findings_pending(client):
+    """
+    A package with license_risk="none" + security_risk="critical" + a
+    pending CVE finding must render as "human_review" with an action
+    label that includes "Review" — not "clean" + "View Details".
+    """
+    from nodes.report_node import _reports
+    _seed_job("job-cve-only-pending", use_case="saas")
+    _reports["job-cve-only-pending"] = {
+        "job_id": "job-cve-only-pending",
+        "use_case": "saas",
+        "scanned_at": "2026-05-17T10:00:00Z",
+        "completed_at": "2026-05-17T10:00:31Z",
+        "summary": {},
+        "raw_dependency_tree": {},
+        "audit_trail_entry_count": 1,
+        "chain_valid": True,
+        "executive_summary": "stub",
+        "packages": [
+            {"name": "django", "version": "4.2.3", "transitive": False,
+             "from_cache": False, "license": "BSD-3-Clause",
+             "license_status": "compliant",
+             "license_risk": RiskLevel.NONE,
+             "security_risk": RiskLevel.CRITICAL,
+             "cves": [], "cached_at": None},
+        ],
+        "license_findings": [],
+        "cve_findings": [{
+            "finding_id": "f-cve-django",
+            "package": "django", "version": "4.2.3",
+            "finding_type": "cve",
+            "severity": RiskLevel.CRITICAL,
+            "description": "SQL injection",
+            "recommendation": "Upgrade",
+            "decision_status": DecisionStatus.HUMAN_REVIEW,
+            "remediations": [],
+            "citations": [],
+        }],
+    }
+    with _patch_graph():
+        resp = client.get("/scan/risk-matrix/job-cve-only-pending?view=grouped")
+    assert resp.status_code == 200
+    row = next(r for r in resp.json()["rows"] if r["package"] == "django")
+    assert row["overall_status"] == "human_review", (
+        f"Django row should be human_review, got: {row}"
+    )
+    assert "Review" in row["action_label"], (
+        f"action_label should contain 'Review' (not 'View Details'): "
+        f"{row['action_label']!r}"
+    )
+
+
+def test_overall_status_clean_only_when_no_risk_no_findings(client):
+    """A package with neither findings nor non-none risk dimensions is clean."""
+    from nodes.report_node import _reports
+    _seed_job("job-truly-clean", use_case="saas")
+    _reports["job-truly-clean"] = {
+        "job_id": "job-truly-clean",
+        "use_case": "saas",
+        "scanned_at": "2026-05-17T10:00:00Z",
+        "completed_at": "2026-05-17T10:00:31Z",
+        "summary": {}, "raw_dependency_tree": {},
+        "audit_trail_entry_count": 1, "chain_valid": True,
+        "executive_summary": "stub",
+        "packages": [
+            {"name": "requests", "version": "2.31.0", "transitive": False,
+             "from_cache": False, "license": "Apache-2.0",
+             "license_status": "compliant",
+             "license_risk": RiskLevel.NONE, "security_risk": RiskLevel.NONE,
+             "cves": [], "cached_at": None},
+        ],
+        "license_findings": [], "cve_findings": [],
+    }
+    with _patch_graph():
+        resp = client.get("/scan/risk-matrix/job-truly-clean?view=grouped")
+    row = next(r for r in resp.json()["rows"] if r["package"] == "requests")
+    assert row["overall_status"] == "clean"
+    assert row["action_label"] == "Clean"
+
+
+# ---------------------------------------------------------------------------
+# Audit trail pre-seal surfacing
+# ---------------------------------------------------------------------------
+
+def test_audit_trail_returns_pending_events_with_seal_status_pre_seal(client):
+    """
+    Pre-seal (no audit_trail in state yet, but audit_events accumulated
+    during scan), /audit/trail must surface the pending events so the
+    dashboard can show activity accumulating mid-scan. Each entry is
+    stamped with seal_status="pending" and placeholder hash fields.
+    """
+    _seed_job("job-audit-pending", use_case="saas")
+    state_values = {
+        "use_case": "saas",
+        "status": "awaiting_human",
+        "audit_trail": [],  # not yet sealed
+        "audit_events": [
+            {"timestamp": "2026-05-17T10:00:01Z",
+             "event_type": "scan_started",
+             "payload": {"job_id": "job-audit-pending"}},
+            {"timestamp": "2026-05-17T10:00:02Z",
+             "event_type": "sbom_resolved",
+             "payload": {"packages_total": 47}},
+            {"timestamp": "2026-05-17T10:00:03Z",
+             "event_type": "cve_contextualized",
+             "payload": {"package": "django", "raw_severity": "critical"}},
+        ],
+    }
+    with _patch_graph(values=state_values):
+        resp = client.get("/audit/trail/job-audit-pending")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["seal_status"] == "pending"
+    assert body["entry_count"] == 3
+    assert body["chain_valid"] is None
+    # Each surfaced entry carries seal_status="pending" + placeholder hash
+    # fields (NOT real hashes — typographically distinct so consumers can't
+    # confuse them with sealed entries).
+    for entry in body["entries"]:
+        assert entry["seal_status"] == "pending"
+        assert entry["entry_hash"].startswith("PENDING")
+        assert entry["prev_hash"].startswith("PENDING")
+    # Event types preserved in order.
+    assert [e["event_type"] for e in body["entries"]] == [
+        "scan_started", "sbom_resolved", "cve_contextualized",
+    ]
+
+
+def test_audit_verify_returns_pending_shape_pre_seal(client):
+    """
+    /audit/verify must NOT return "PASS · 0 entries · No tampering detected"
+    when the chain is empty pre-seal. That would mislead the demo. Instead
+    surface seal_status="pending" with an explanatory message.
+    """
+    _seed_job("job-verify-pending", use_case="saas")
+    state_values = {
+        "use_case": "saas",
+        "audit_trail": [],
+        "audit_events": [
+            {"timestamp": "2026-05-17T10:00:01Z",
+             "event_type": "scan_started", "payload": {}},
+            {"timestamp": "2026-05-17T10:00:02Z",
+             "event_type": "license_scanned", "payload": {}},
+        ],
+    }
+    with _patch_graph(values=state_values):
+        resp = client.get("/audit/verify/job-verify-pending")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["seal_status"] == "pending"
+    assert body["verdict"] == "PENDING"
+    assert body["chain_valid"] is None
+    assert body["entries_verified"] == 0
+    assert body["pending_entries"] == 2
+    assert "not yet sealed" in body["message"]
+
+
+# ---------------------------------------------------------------------------
 # Static dashboard mount
 # ---------------------------------------------------------------------------
 
