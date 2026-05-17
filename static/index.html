@@ -103,6 +103,16 @@ const CITATION_CLASSES = {
   policy: "bg-purple-100 text-purple-800",
 };
 
+const REM_TYPE_CLASSES = {
+  version_bump: "bg-green-50 text-green-800",
+  accept_as_is: "bg-blue-50 text-blue-800",
+  compensating_control: "bg-purple-50 text-purple-800",
+  monitor: "bg-amber-50 text-amber-900",
+  package_swap: "bg-orange-50 text-orange-800",
+  config_change: "bg-slate-50 text-slate-700",
+  no_fix_available: "bg-red-50 text-red-800",
+};
+
 const USE_CASE_LABELS = {
   saas: "SaaS",
   internal: "Internal",
@@ -568,13 +578,14 @@ function renderResultsSection() {
               <th class="text-left px-4 py-3 font-medium">Package</th>
               <th class="text-left px-4 py-3 font-medium">License risk</th>
               <th class="text-left px-4 py-3 font-medium">Security risk</th>
+              <th class="text-left px-4 py-3 font-medium">Context risk</th>
               <th class="text-left px-4 py-3 font-medium">Status</th>
               <th class="text-right px-4 py-3 font-medium">Action</th>
             </tr>
           </thead>
           <tbody id="risk-tbody">
             ${filtered.length === 0
-              ? `<tr><td colspan="5" class="px-4 py-8 text-center text-slate-400 italic">No packages match the current filters.</td></tr>`
+              ? `<tr><td colspan="6" class="px-4 py-8 text-center text-slate-400 italic">No packages match the current filters.</td></tr>`
               : filtered.map(renderTableRow).join("")
             }
           </tbody>
@@ -788,6 +799,12 @@ function renderTableRow(row) {
     : (row.finding_count > 0
        ? `<span class="text-slate-600">View Details</span>`
        : `<span class="text-green-700">✓ Clean</span>`);
+  const ctxRiskCell = row.contextualized_severity
+    ? `<span class="inline-flex items-center gap-1">
+         <span class="text-[10px] text-slate-400 uppercase tracking-wide">ctx:</span>
+         ${sevPill(row.contextualized_severity, "text-[10px] px-1.5 py-0.5")}
+       </span>`
+    : `<span class="text-slate-300">—</span>`;
   const main = `
     <tr data-row-key="${esc(key)}" class="border-b border-slate-100 hover:bg-slate-50 cursor-pointer transition duration-150 ${expanded ? "bg-slate-50" : ""}">
       <td class="px-4 py-3">
@@ -797,6 +814,7 @@ function renderTableRow(row) {
       </td>
       <td class="px-4 py-3">${sevPill(row.license_risk)}</td>
       <td class="px-4 py-3">${sevPill(row.security_risk)}</td>
+      <td class="px-4 py-3">${ctxRiskCell}</td>
       <td class="px-4 py-3">${overallStatusPill(row.overall_status)}</td>
       <td class="px-4 py-3 text-right text-sm">${action}</td>
     </tr>
@@ -813,7 +831,7 @@ function renderExpandedRow(row) {
 
   return `
     <tr>
-      <td colspan="5" class="p-0 bg-slate-50 border-b border-slate-200">
+      <td colspan="6" class="p-0 bg-slate-50 border-b border-slate-200">
         <div class="border-l-4 border-indigo-400 p-6">
           ${inner}
         </div>
@@ -848,16 +866,26 @@ function renderDependencyChain(row) {
 
 function renderFindingDetail(f, row) {
   const sev = (f.severity || "none").toLowerCase();
+  const ctxSevRaw = f.contextualized_severity;
+  const ctxSev = ctxSevRaw ? String(ctxSevRaw).toLowerCase() : null;
   const type = f.finding_type === "cve" ? "CVE" : (f.finding_type || "Finding").replace(/_/g, " ");
   const pending = (f.decision_status || "").toLowerCase() === "human_review";
   const decided = ["accepted", "deferred", "auto_remediate"].includes((f.decision_status || "").toLowerCase());
+  const ctxRationale = f.contextualization_rationale;
 
   return `
     <div id="finding-${esc(f.finding_id)}" class="space-y-6">
       <!-- Section A: header -->
       <div>
-        <div class="flex items-center gap-3 mb-2">
+        <div class="flex items-center gap-3 mb-2 flex-wrap">
           ${sevPill(sev, "text-sm px-2.5 py-1")}
+          ${ctxSev ? `
+            <span class="text-slate-400" aria-hidden="true">→</span>
+            <span class="inline-flex items-center gap-1">
+              <span class="text-[10px] text-slate-400 uppercase tracking-wide">ctx:</span>
+              ${sevPill(ctxSev, "text-sm px-2.5 py-1")}
+            </span>
+          ` : ""}
           <span class="text-xs uppercase tracking-wide text-slate-500">${esc(type)}</span>
           <span class="font-mono text-xs text-slate-400">${esc(f.finding_id)}</span>
         </div>
@@ -867,6 +895,19 @@ function renderFindingDetail(f, row) {
 
       <!-- Section B: dependency chain (only on first finding for the row) -->
       ${renderDependencyChain(row)}
+
+      <!-- Section B': contextualization callout (only when present) -->
+      ${ctxRationale ? `
+        <div class="border border-indigo-200 bg-indigo-50/40 rounded-md p-4 border-l-4 border-l-indigo-400">
+          <div class="flex items-center gap-2 mb-2">
+            <h4 class="text-xs uppercase tracking-wide text-indigo-700 font-semibold">Context analysis</h4>
+            <span class="text-xs text-slate-500">
+              ${sevPill(sev, "text-[10px] px-1.5 py-0")} <span class="text-slate-400">→</span> ${sevPill(ctxSev || sev, "text-[10px] px-1.5 py-0")}
+            </span>
+          </div>
+          <p class="text-sm italic text-slate-700 leading-relaxed">${esc(ctxRationale)}</p>
+        </div>
+      ` : ""}
 
       <!-- Section C: citations -->
       <div>
@@ -922,7 +963,9 @@ function renderCitationCard(c) {
 }
 
 function renderRemediationCard(r, isRecommended) {
-  const typeLabel = ((r.type || "") + "").replace(/_/g, " ");
+  const typeKey = String(r.type || "").toLowerCase();
+  const typeLabel = typeKey.replace(/_/g, " ");
+  const typeCls = REM_TYPE_CLASSES[typeKey] || "bg-slate-100 text-slate-700";
   const target = r.target_version
     ? (r.target_package
        ? `<div class="font-mono text-sm mt-2"><span class="text-slate-500">Swap to:</span> ${esc(r.target_package)}==${esc(r.target_version)}</div>`
@@ -930,16 +973,47 @@ function renderRemediationCard(r, isRecommended) {
     : "";
   const citations = (r.citations || []).slice(0, 4)
     .map(c => citationBadge(c.source)).join(" ");
+
+  // Citation-source-aware header label. Authoritative registry citations
+  // (OSV/NVD/GHSA/SPDX/PYPI/POLICY) → "Authoritative fix". LLM_INFERENCE
+  // → "Context-aware recommendation". Mixed or unknown → fall back to
+  // the generic recommended label.
+  const sources = new Set(
+    (r.citations || []).map(c => String(c.source || "").toLowerCase())
+  );
+  let headerLabel = null;
+  let headerCls = "bg-slate-100 text-slate-700";
+  if (sources.has("llm_inference") && sources.size === 1) {
+    headerLabel = "Context-aware recommendation";
+    headerCls = "bg-yellow-100 text-yellow-900 border border-yellow-300";
+  } else if (
+    sources.has("osv") || sources.has("nvd") || sources.has("ghsa") ||
+    sources.has("spdx") || sources.has("pypi") || sources.has("policy")
+  ) {
+    const registry = sources.has("osv") ? "OSV"
+      : sources.has("nvd") ? "NVD"
+      : sources.has("ghsa") ? "GHSA"
+      : sources.has("spdx") ? "SPDX"
+      : sources.has("pypi") ? "PyPI"
+      : "registry";
+    headerLabel = `Authoritative fix (${registry})`;
+    headerCls = "bg-indigo-100 text-indigo-700";
+  } else if (isRecommended) {
+    headerLabel = "Recommended";
+    headerCls = "bg-indigo-100 text-indigo-700";
+  }
+
   return `<div class="border ${isRecommended ? "border-indigo-300 bg-indigo-50/40" : "border-slate-200 bg-white"} rounded-md p-4">
-    <div class="flex items-center justify-between mb-2">
+    <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
       <div class="flex items-center gap-2">
-        <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-700 capitalize">${esc(typeLabel)}</span>
-        ${isRecommended ? `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-indigo-100 text-indigo-700">RECOMMENDED</span>` : ""}
+        <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium capitalize ${typeCls}">${esc(typeLabel)}</span>
+        ${headerLabel ? `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${headerCls}">${esc(headerLabel)}</span>` : ""}
       </div>
       ${r.confidence ? `<span class="text-xs text-slate-400">confidence: ${esc(r.confidence)}</span>` : ""}
     </div>
     <div class="text-sm text-slate-700">${esc(r.description || "")}</div>
     ${target}
+    ${r.rationale ? `<div class="text-xs text-slate-600 mt-2"><span class="font-medium">Rationale:</span> ${esc(r.rationale)}</div>` : ""}
     ${r.tradeoffs ? `<div class="text-xs italic text-slate-600 mt-2">${esc(r.tradeoffs)}</div>` : ""}
     ${citations ? `<div class="mt-3 flex gap-1 flex-wrap">${citations}</div>` : ""}
   </div>`;
