@@ -286,3 +286,181 @@ def test_real_graph_source_registers_risk_node_with_defer_true():
         "DecisionGate can fire. Search for the comment block in graph.py "
         "for the architectural reasoning."
     )
+
+
+# ---------------------------------------------------------------------------
+# HITL interrupt + resume — regression for the "Submit Decision is a no-op"
+# bug where resume_after_hitl called aupdate_state alone and never actually
+# advanced execution past the interrupt.
+# ---------------------------------------------------------------------------
+
+def test_command_resume_advances_paused_graph_past_interrupt():
+    """
+    Behavioral lock: the LangGraph runtime supports advancing a paused
+    graph via `graph.ainvoke(Command(resume=value), config)`. value is
+    delivered as the return value of the suspended `interrupt(...)`
+    call, and the node then runs its post-interrupt code.
+
+    This is the pattern resume_after_hitl uses. If a future
+    LangGraph version breaks this contract, this test catches it
+    before the bug reaches production.
+    """
+    from langgraph.types import Command, interrupt as lg_interrupt
+    from langgraph.checkpoint.memory import MemorySaver
+
+    class S2(TypedDict, total=False):
+        pending:  list
+        resolved: Annotated[list, operator.add]
+        status:   str
+
+    async def gate(state):
+        if state.get("pending"):
+            decisions = lg_interrupt({"pending": state["pending"]})
+            return {
+                "resolved": list(decisions or []),
+                "pending": [],
+                "status": "done",
+            }
+        return {"status": "done"}
+
+    b = StateGraph(S2)
+    b.add_node("gate", gate)
+    b.set_entry_point("gate")
+    b.add_edge("gate", END)
+    g = b.compile(checkpointer=MemorySaver())
+
+    async def go():
+        cfg = {"configurable": {"thread_id": "hitl-1"}}
+        # Step 1: drive the graph until it hits interrupt.
+        try:
+            await g.ainvoke(
+                {"pending": ["fid-1"], "resolved": [], "status": "running"},
+                config=cfg,
+            )
+        except Exception:
+            pass
+        snap = await g.aget_state(cfg)
+        assert snap.values.get("status") == "running", (
+            "graph should be paused at interrupt with original status"
+        )
+        assert snap.values.get("resolved") == []
+
+        # Step 2: resume with Command(resume=...). This is what
+        # resume_after_hitl does. The gate node receives the decisions
+        # list as the return value of its interrupt() call and runs its
+        # post-interrupt code.
+        await g.ainvoke(Command(resume=["d1"]), config=cfg)
+
+        snap = await g.aget_state(cfg)
+        assert snap.values.get("status") == "done", (
+            f"graph did NOT advance past interrupt after Command(resume=...). "
+            f"final state: {snap.values}"
+        )
+        assert snap.values.get("resolved") == ["d1"], (
+            f"gate's post-interrupt code did not run: {snap.values}"
+        )
+
+    asyncio.run(go())
+
+
+def test_aupdate_state_alone_does_not_advance_paused_graph():
+    """
+    Negative control: the OLD resume pattern (graph.aupdate_state with
+    `{"__interrupt__": decisions}` + `as_node="..."` and NOTHING ELSE)
+    does NOT advance the graph past the interrupt. This is exactly what
+    resume_after_hitl used to do, and why Submit Decision was a no-op.
+
+    If this test ever starts failing (i.e. aupdate_state alone DOES
+    advance the graph), it means the LangGraph runtime changed and
+    the documented bug history in graph.py needs revision.
+    """
+    from langgraph.types import interrupt as lg_interrupt
+    from langgraph.checkpoint.memory import MemorySaver
+
+    class S3(TypedDict, total=False):
+        pending:  list
+        resolved: Annotated[list, operator.add]
+        status:   str
+
+    async def gate(state):
+        if state.get("pending"):
+            decisions = lg_interrupt({"pending": state["pending"]})
+            return {
+                "resolved": list(decisions or []),
+                "pending": [],
+                "status": "done",
+            }
+        return {"status": "done"}
+
+    b = StateGraph(S3)
+    b.add_node("gate", gate)
+    b.set_entry_point("gate")
+    b.add_edge("gate", END)
+    g = b.compile(checkpointer=MemorySaver())
+
+    async def go():
+        cfg = {"configurable": {"thread_id": "hitl-2"}}
+        try:
+            await g.ainvoke(
+                {"pending": ["fid-1"], "resolved": [], "status": "running"},
+                config=cfg,
+            )
+        except Exception:
+            pass
+        # Use the OLD pattern: aupdate_state alone, no ainvoke.
+        await g.aupdate_state(
+            cfg, {"__interrupt__": ["d1"]}, as_node="gate"
+        )
+        snap = await g.aget_state(cfg)
+        # The graph did NOT advance: gate's post-interrupt code didn't run.
+        assert snap.values.get("status") == "running"
+        assert snap.values.get("resolved") == []
+
+    asyncio.run(go())
+
+
+def test_resume_after_hitl_uses_ainvoke_with_command_resume():
+    """
+    Contract lock on the production graph.resume_after_hitl. It MUST
+    call graph.ainvoke with a Command(resume=decisions) argument so
+    the paused decision_gate_node receives the decisions and executes
+    its post-interrupt code.
+
+    The legacy implementation called only graph.aupdate_state(...) and
+    skipped ainvoke — leaving the graph paused forever. This test
+    intercepts graph.ainvoke and asserts on the call shape so any
+    regression to the old pattern fails the build.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+    from langgraph.types import Command
+    from graph import resume_after_hitl
+    import graph as graph_module
+
+    decisions = [{
+        "finding_id": "f-x",
+        "decision_status": "accepted",
+        "rationale": "ok",
+        "decided_by": "demo@test",
+    }]
+
+    captured = {}
+    async def fake_ainvoke(input_, *, config=None):
+        captured["input"] = input_
+        captured["config"] = config
+        return {}
+
+    with patch.object(graph_module.graph, "ainvoke", new=fake_ainvoke):
+        asyncio.run(resume_after_hitl("job-x", decisions))
+
+    assert isinstance(captured.get("input"), Command), (
+        "resume_after_hitl must call graph.ainvoke with a Command(...) "
+        "input, not aupdate_state alone."
+    )
+    # Command(resume=...) is the canonical resume payload.
+    assert captured["input"].resume == decisions, (
+        f"Command.resume payload should be the decisions list; got "
+        f"{captured['input'].resume!r}"
+    )
+    # The config must scope the resume to this job's thread_id.
+    assert captured["config"]["configurable"]["thread_id"] == "job-x"

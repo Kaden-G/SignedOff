@@ -81,6 +81,7 @@ Audit trail:
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 
 from agent_state import AgentState
 from nodes.input_node import input_node
@@ -406,11 +407,29 @@ def make_config(job_id: str) -> dict:
 # ---------------------------------------------------------------------------
 async def resume_after_hitl(job_id: str, decisions: list[dict]) -> None:
     """
-    Resume a graph that is paused at the DecisionGateNode interrupt.
+    Resume a graph paused at the DecisionGateNode interrupt.
 
-    Injects human decisions into the graph state and resumes execution
-    from the interrupt point. LangGraph replays from the checkpoint,
-    applying the injected decisions.
+    LangGraph >=0.2 resumes interrupted graphs by calling
+    `graph.ainvoke(Command(resume=value), config)`. The `value` is
+    delivered as the return value of the suspended `interrupt(...)`
+    call inside `decision_gate_node`, which then runs its
+    post-interrupt logic: stamps decided_at / decided_by on each
+    finding, moves them from pending_human_review to resolved_findings,
+    emits the `human_decisions_recorded` audit event, and either
+    re-enters the interrupt (more findings still pending) or proceeds
+    through the rest of the graph to AuditNode + ReportNode.
+
+    HISTORICAL NOTE on the prior implementation: this function
+    previously called `graph.aupdate_state(...,
+    {"__interrupt__": decisions}, as_node="decision_gate_node")` and
+    nothing else. That writes a checkpoint but does NOT advance
+    execution — the graph stayed paused at the interrupt forever, so
+    the API endpoint returned 200 but the decision never took effect
+    end-to-end: resolved_findings stayed empty, pending_human_review
+    never shrank, and the audit trail never sealed. The user-visible
+    symptom was a Submit Decision click that produced no observable
+    change in the dashboard. The fix is to use the canonical
+    Command(resume=...) pattern via ainvoke.
 
     Args:
         job_id:    The scan job to resume. Used as thread_id for checkpointer.
@@ -425,11 +444,9 @@ async def resume_after_hitl(job_id: str, decisions: list[dict]) -> None:
     """
     config = make_config(job_id)
 
-    # LangGraph's interrupt resume pattern:
-    # graph.update_state() injects the human response as the interrupt's
-    # return value. The next graph.ainvoke() call resumes from that point.
-    await graph.aupdate_state(
-        config,
-        {"__interrupt__": decisions},
-        as_node="decision_gate_node",
-    )
+    # ainvoke runs the graph until it either completes or hits the next
+    # interrupt. If more findings are still pending after this decision,
+    # decision_gate_node will re-suspend on its next interrupt() call
+    # and ainvoke returns normally. The API endpoint then reports the
+    # remaining pending count to the caller.
+    await graph.ainvoke(Command(resume=decisions), config=config)
