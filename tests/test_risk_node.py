@@ -748,3 +748,117 @@ def test_ctx_per_finding_audit_event_includes_recommended_action_type():
         e for e in result["audit_events"] if e["event_type"] == "cve_contextualized"
     )
     assert ctx_event["payload"]["recommended_action_type"] == "compensating_control"
+
+
+# ---------------------------------------------------------------------------
+# Routed decision_status persistence across LangGraph checkpoint
+# ---------------------------------------------------------------------------
+
+def test_routed_decision_status_persists_on_returned_license_and_cve_findings():
+    """
+    Regression for the dashboard-blocking bug where CVE findings were
+    stuck at decision_status='pending' even after RiskNode routed them
+    to HUMAN_REVIEW. The frontend gates the Submit Decision form on
+    decision_status == 'human_review', so CVE findings never showed
+    Accept / Defer / Auto-Remediate buttons.
+
+    Root cause: RiskNode mutates Finding dicts in place to set
+    decision_status, but those mutations don't survive LangGraph's
+    checkpoint serialization unless RiskNode's return dict includes
+    the license_findings / cve_findings keys. LicenseNode happens to
+    write decision_status=HUMAN_REVIEW directly at finding-construction
+    time, masking the bug on the license branch.
+
+    Fix: RiskNode's return dict now includes both license_findings and
+    cve_findings with the routed decision_status applied.
+
+    Contract:
+      - For a CVE finding routed to HUMAN_REVIEW, the corresponding
+        Finding dict in result["cve_findings"] must have
+        decision_status == HUMAN_REVIEW (not PENDING).
+      - Same invariant for license findings (regression guard against
+        a future refactor that drops the license_findings emission).
+      - pending_human_review must contain BOTH the license and CVE
+        findings (stays in sync with the per-finding decision_status).
+    """
+    lic = _finding(
+        RiskLevel.CRITICAL,
+        finding_type="license_violation",
+        citations=[_citation(CitationSource.SPDX)],
+        package="mysqlclient", version="2.1.1",
+    )
+    cve = _finding(
+        RiskLevel.CRITICAL,
+        finding_type="cve",
+        citations=[_citation(CitationSource.OSV)],
+        package="django", version="4.2.3",
+    )
+    # Both start at PENDING — mimics the as-produced state from
+    # LicenseNode/CVENode before RiskNode routes them. This is the
+    # asymmetry: in production LicenseNode pre-sets HUMAN_REVIEW
+    # which masks the bug for licenses, but the routing logic should
+    # work correctly for ANY incoming decision_status.
+    lic["decision_status"] = DecisionStatus.PENDING
+    cve["decision_status"] = DecisionStatus.PENDING
+
+    with _patch_summary():
+        result = _run(risk_node(_state(
+            license_findings=[lic], cve_findings=[cve],
+        )))
+
+    # Both Finding-list outputs must be present in the return dict
+    # so LangGraph persists the routed decision_status to state.
+    assert "license_findings" in result, (
+        "RiskNode must emit license_findings so the routed decision_status "
+        "persists across checkpoint serialization."
+    )
+    assert "cve_findings" in result, (
+        "RiskNode must emit cve_findings so the routed decision_status "
+        "persists across checkpoint serialization."
+    )
+
+    # Both findings carry the routed decision_status.
+    returned_lic = result["license_findings"][0]
+    returned_cve = result["cve_findings"][0]
+    assert returned_lic["decision_status"] == DecisionStatus.HUMAN_REVIEW, (
+        f"license finding's decision_status still PENDING after routing: "
+        f"{returned_lic['decision_status']!r}"
+    )
+    assert returned_cve["decision_status"] == DecisionStatus.HUMAN_REVIEW, (
+        f"cve finding's decision_status still PENDING after routing: "
+        f"{returned_cve['decision_status']!r}"
+    )
+
+    # And both should be in pending_human_review[] — that bucket has
+    # always worked, but assert it here to lock the
+    # in-sync-with-decision_status contract.
+    pending_ids = {f["finding_id"] for f in result["pending_human_review"]}
+    assert lic["finding_id"] in pending_ids
+    assert cve["finding_id"] in pending_ids
+
+
+def test_auto_remediate_cve_finding_decision_status_persists_too():
+    """
+    Routing-decision persistence isn't just about HUMAN_REVIEW. A CVE
+    finding routed to AUTO_REMEDIATE must also surface that status in
+    the returned cve_findings list — otherwise downstream consumers
+    (the dashboard, auto-remediate node, report builder) see PENDING
+    and treat it as un-routed.
+    """
+    # LOW-severity CVE → routed to AUTO_REMEDIATE under default policy.
+    f = _finding(
+        RiskLevel.LOW, finding_type="cve",
+        citations=[_citation(CitationSource.OSV)],
+    )
+    f["decision_status"] = DecisionStatus.PENDING
+
+    with _patch_summary():
+        result = _run(risk_node(_state(cve_findings=[f])))
+
+    returned = result["cve_findings"][0]
+    assert returned["decision_status"] == DecisionStatus.AUTO_REMEDIATE, (
+        f"low-severity CVE was not routed to AUTO_REMEDIATE in the "
+        f"returned cve_findings list: {returned['decision_status']!r}"
+    )
+    assert returned["decided_by"] == "auto"
+    assert returned["decided_at"] is not None

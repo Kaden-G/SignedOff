@@ -917,8 +917,29 @@ async def risk_node(state: AgentState) -> dict:
 
     status = "awaiting_human" if pending_human_review else "running"
 
+    # IMPORTANT: include license_findings and cve_findings in the return
+    # so the routed decision_status survives LangGraph's checkpoint
+    # serialization. The Stage-1 loop above mutates finding dicts in
+    # place (f["decision_status"] = route_finding(f, policy)), but those
+    # mutations don't propagate to persisted state unless the affected
+    # fields appear in this return dict — LangGraph re-hydrates the
+    # state from the last checkpoint, not from in-memory Python
+    # references. Pre-fix symptom: LicenseNode happens to write
+    # decision_status=HUMAN_REVIEW directly at finding-construction
+    # time (license_node.py lines 429, 555), so license findings looked
+    # "correct" in /scan/results; CVENode writes the default PENDING,
+    # so CVE findings were stuck at PENDING in the persisted state even
+    # though pending_human_review[] (returned correctly) listed them.
+    # The dashboard's decision-form gate is on decision_status =
+    # "human_review", so CVE findings never showed Accept / Defer /
+    # Auto-Remediate buttons. The local license_findings / cve_findings
+    # lists hold the SAME mutated Finding dict references as
+    # all_findings, so emitting them here picks up the routed
+    # decision_status for both branches symmetrically.
     return {
         "risk_matrix": all_findings,
+        "license_findings": license_findings,
+        "cve_findings": cve_findings,
         "risk_summary": risk_summary,
         "pending_human_review": pending_human_review,
         "resolved_findings": resolved_findings,
