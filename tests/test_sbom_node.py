@@ -1,14 +1,12 @@
-"""Tests for nodes.sbom_node."""
+"""Tests for nodes.sbom_node — post-PyPI-rewrite (v1.1)."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
-import json
-import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -17,8 +15,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from cache.l1_package_cache import l1_cache  # noqa: E402
 from nodes.sbom_node import (  # noqa: E402
     _detect_gpl_in_multi_license,
+    _parse_classifier_to_license_string,
+    _resolve_license_from_pypi,
     normalize_license,
     parse_direct_package_names,
+    parse_requirements_with_versions,
     sbom_node,
 )
 
@@ -31,69 +32,49 @@ def _b64(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
-# Fixtures -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# PackageRecord-shape fixtures returned by the mocked PyPI resolver.
+# These mimic what _resolve_packages_from_pypi() builds for the real
+# code path, so the sbom_node test surface stays close to production.
+# ---------------------------------------------------------------------------
 
-PIPDEPTREE_FIXTURE = [
-    {
-        "key": "django",
-        "package_name": "Django",
-        "installed_version": "4.2.3",
-        "dependencies": [
-            {
-                "key": "asgiref",
-                "package_name": "asgiref",
-                "installed_version": "3.7.2",
-                "dependencies": [],
-            },
-            {
-                "key": "sqlparse",
-                "package_name": "sqlparse",
-                "installed_version": "0.4.4",
-                "dependencies": [],
-            },
-        ],
-    },
-    {
-        "key": "requests",
-        "package_name": "requests",
-        "installed_version": "2.31.0",
-        "dependencies": [
-            {
-                "key": "urllib3",
-                "package_name": "urllib3",
-                "installed_version": "2.0.7",
-                "dependencies": [],
-            },
-        ],
-    },
-    {
-        "key": "asgiref",
-        "package_name": "asgiref",
-        "installed_version": "3.7.2",
-        "dependencies": [],
-    },
-]
+def _pypi_record(name: str, version: str, license_id: str | None) -> dict:
+    return {
+        "name": name,
+        "version": version,
+        "license": license_id,
+        "license_status": None,
+        "cves": [],
+        "license_risk": None,
+        "security_risk": None,
+        "from_cache": False,
+        "cached_at": None,
+        "transitive": False,
+    }
 
-PIP_LICENSES_FIXTURE = [
-    {"Name": "Django", "Version": "4.2.3", "License": "BSD License"},
-    {"Name": "asgiref", "Version": "3.7.2", "License": "BSD License"},
-    {"Name": "sqlparse", "Version": "0.4.4", "License": "BSD License"},
-    {"Name": "requests", "Version": "2.31.0", "License": "Apache 2.0"},
-    {"Name": "urllib3", "Version": "2.0.7", "License": "MIT License"},
+
+DJANGO_REQUESTS_RECORDS = [
+    _pypi_record("Django", "4.2.3", "BSD-3-Clause"),
+    _pypi_record("requests", "2.31.0", "Apache-2.0"),
 ]
 
 
-def _fake_subprocess(*args, **kwargs):
-    cmd = args[0] if args else kwargs.get("args")
-    if cmd[0] == "pipdeptree":
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=json.dumps(PIPDEPTREE_FIXTURE), stderr=""
-        )
-    if cmd[0] == "pip-licenses":
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=json.dumps(PIP_LICENSES_FIXTURE), stderr=""
-        )
-    raise AssertionError(f"unexpected command: {cmd}")
+_NO_OVERRIDE = object()  # sentinel — distinguishes "default" from "[]"
+
+
+def _patch_pypi(records=_NO_OVERRIDE, errors=_NO_OVERRIDE):
+    """Patch _resolve_packages_from_pypi to a deterministic return value.
+    Mirrors the spec's "function-level mock" guidance — avoids needing to
+    mock aiohttp internals for every sbom_node integration test.
+
+    Pass `records=[]` to simulate "every PyPI fetch failed" (the sentinel
+    distinguishes that from the "use default" case)."""
+    final_records = DJANGO_REQUESTS_RECORDS if records is _NO_OVERRIDE else records
+    final_errors = [] if errors is _NO_OVERRIDE else errors
+    return patch(
+        "nodes.sbom_node._resolve_packages_from_pypi",
+        new=AsyncMock(return_value=(final_records, final_errors)),
+    )
 
 
 def _state(requirements: str = "django==4.2.3\nrequests==2.31.0\n",
@@ -114,14 +95,17 @@ def setup_function(_):
     l1_cache.clear()
 
 
-# Tests ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# sbom_node — happy path + PackageRecord shape
+# ---------------------------------------------------------------------------
 
 def test_returns_normalized_package_records_with_full_typeddict_shape():
-    with patch("nodes.sbom_node.subprocess.run", side_effect=_fake_subprocess):
+    with _patch_pypi():
         result = _run(sbom_node(_state()))
 
     assert result["status"] == "running"
-    assert len(result["packages"]) == 5
+    # PyPI-only resolution returns direct deps; demo state has django + requests.
+    assert len(result["packages"]) == 2
 
     expected_fields = {
         "name", "version", "license", "license_status", "cves",
@@ -136,27 +120,366 @@ def test_returns_normalized_package_records_with_full_typeddict_shape():
         assert pkg["license_risk"] is None
         assert pkg["security_risk"] is None
         assert pkg["from_cache"] is False  # no L1 hits in this test
+        # All PyPI-resolved packages are direct (v1.1 scope).
+        assert pkg["transitive"] is False
 
     sbom_event = next(
         e for e in result["audit_events"] if e["event_type"] == "sbom_resolved"
     )
-    assert sbom_event["payload"]["packages_total"] == 5
-    assert sbom_event["payload"]["packages_direct"] == 2  # django + requests
-    assert sbom_event["payload"]["packages_transitive"] == 3
+    assert sbom_event["payload"]["packages_total"] == 2
+    assert sbom_event["payload"]["packages_direct"] == 2
+    assert sbom_event["payload"]["packages_transitive"] == 0
     assert sbom_event["payload"]["cache_hits"] == 0
 
 
-def test_deduplicates_direct_and_transitive_with_direct_winning():
-    # asgiref appears twice in pipdeptree (transitive of django, top-level entry).
-    # When listed in requirements, it should appear ONCE with transitive=False.
-    requirements = "django==4.2.3\nrequests==2.31.0\nasgiref==3.7.2\n"
-    with patch("nodes.sbom_node.subprocess.run", side_effect=_fake_subprocess):
+def test_v1_1_limitation_surfaced_in_errors():
+    """Every requirements_file scan surfaces the 'direct deps only' caveat
+    so the UI and smoke tests can detect / display the v1.1 boundary."""
+    with _patch_pypi():
+        result = _run(sbom_node(_state()))
+    assert any(
+        "v1.1 limitation" in e and "direct dependencies" in e
+        for e in result["errors"]
+    ), f"v1.1 limitation note missing from errors: {result['errors']}"
+
+
+def test_sbom_node_uses_pypi_not_subprocess():
+    """The previous implementation shelled out to pipdeptree / pip-licenses
+    against the server's running venv (BUGS.md ROOT CAUSE). Lock that the
+    new implementation never touches subprocess for the SBOM path.
+
+    This guards against a future refactor accidentally reintroducing the
+    bug — anyone who adds a subprocess.run() call will trip this test."""
+    import subprocess
+    with patch("subprocess.run") as mock_run, _patch_pypi():
+        _run(sbom_node(_state()))
+    assert mock_run.call_count == 0, (
+        f"sbom_node called subprocess.run {mock_run.call_count}x; "
+        "the PyPI-based resolution must never shell out to pipdeptree/pip-licenses."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dedup: requirements.txt can list the same package twice
+# ---------------------------------------------------------------------------
+
+def test_duplicate_requirement_lines_deduplicated():
+    """PyYAML appears twice in demo_requirements.txt (pinned to the same
+    version). The parser must deduplicate so a downstream PyPI call isn't
+    wasted and the same package doesn't appear twice in the matrix."""
+    parsed = parse_requirements_with_versions(
+        "PyYAML==5.4.1\npyyaml==5.4.1\nrequests==2.31.0\n"
+    )
+    names = [n for n, _ in parsed]
+    assert names == ["PyYAML", "requests"], parsed
+
+
+# ---------------------------------------------------------------------------
+# Failure paths
+# ---------------------------------------------------------------------------
+
+def test_all_pypi_lookups_fail_marks_status_failed():
+    """If every PyPI fetch fails (network down, registry returning 404
+    for every name), there's nothing to scan. Treat as fatal."""
+    with _patch_pypi(
+        records=[],
+        errors=["PyPI 404 for django==4.2.3", "PyPI 404 for requests==2.31.0"],
+    ):
+        result = _run(sbom_node(_state()))
+
+    assert result["status"] == "failed"
+    assert result["packages"] == []
+    assert any(e["event_type"] == "sbom_failed" for e in result["audit_events"])
+    # Fetch errors propagated.
+    assert any("404" in e for e in result["errors"])
+
+
+def test_empty_requirements_file_marks_status_failed():
+    """A requirements file with only comments / blank lines / -r references
+    has no parseable packages. Fail fast — there's nothing to scan."""
+    requirements = "# just a comment\n\n-r other-reqs.txt\n"
+    with _patch_pypi():
         result = _run(sbom_node(_state(requirements=requirements)))
+    assert result["status"] == "failed"
 
-    asgiref_records = [p for p in result["packages"] if p["name"].lower() == "asgiref"]
-    assert len(asgiref_records) == 1
-    assert asgiref_records[0]["transitive"] is False
 
+def test_invalid_base64_input_marks_status_failed():
+    state = _state()
+    state["input_value"] = "!!!not-base64!!!"
+    with _patch_pypi():
+        result = _run(sbom_node(state))
+    assert result["status"] == "failed"
+    assert any("base64" in e.lower() for e in result["errors"])
+
+
+def test_unsupported_input_type_marks_status_failed():
+    state = _state()
+    state["input_type"] = "repo_url"
+    with _patch_pypi():
+        result = _run(sbom_node(state))
+    assert result["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# L1 cache integration — cache check runs AFTER record construction
+# ---------------------------------------------------------------------------
+
+def test_l1_cache_hit_increments_counter_and_populates_record():
+    """Cache check happens in sbom_node after _resolve_packages_from_pypi
+    returns. Mocking the PyPI resolver still exercises the cache logic."""
+    l1_cache.set("Django", "4.2.3", license="BSD-3-Clause", cves=[{"id": "CVE-test"}])
+
+    with _patch_pypi():
+        result = _run(sbom_node(_state()))
+
+    sbom_event = next(
+        e for e in result["audit_events"] if e["event_type"] == "sbom_resolved"
+    )
+    assert sbom_event["payload"]["cache_hits"] == 1
+
+    django = next(p for p in result["packages"] if p["name"].lower() == "django")
+    assert django["from_cache"] is True
+    assert django["cached_at"] is not None
+    assert django["cves"] == [{"id": "CVE-test"}]
+
+
+# ---------------------------------------------------------------------------
+# include_transitive policy flag
+# ---------------------------------------------------------------------------
+
+def test_include_transitive_false_does_not_drop_direct_packages():
+    """The PyPI rewrite doesn't include transitive packages at all (v1.1
+    scope). The include_transitive policy flag becomes a no-op for direct
+    deps — all packages from requirements.txt are direct, so all pass
+    through regardless of the flag."""
+    policy = {
+        "scan_defaults": {"include_transitive": False},
+        "policy_hash": "test",
+    }
+    with _patch_pypi():
+        result = _run(sbom_node(_state(policy=policy)))
+
+    assert result["status"] == "running"
+    names = {p["name"].lower() for p in result["packages"]}
+    assert names == {"django", "requests"}
+    assert all(p["transitive"] is False for p in result["packages"])
+
+
+# ---------------------------------------------------------------------------
+# parse_requirements_with_versions — edge cases
+# ---------------------------------------------------------------------------
+
+def test_parse_requirements_with_versions_pinned():
+    parsed = parse_requirements_with_versions(
+        "django==4.2.3\nrequests==2.28.0\n"
+    )
+    assert parsed == [("django", "4.2.3"), ("requests", "2.28.0")]
+
+
+def test_parse_requirements_with_versions_unpinned():
+    parsed = parse_requirements_with_versions("django>=4.0\nflask\n")
+    assert parsed == [("django", None), ("flask", None)]
+
+
+def test_parse_requirements_with_versions_extras_and_comments():
+    parsed = parse_requirements_with_versions(
+        "requests[security]==2.28.0\n# comment\n-r other.txt\n"
+    )
+    assert parsed == [("requests", "2.28.0")]
+
+
+def test_parse_requirements_with_versions_deduplicates():
+    """First occurrence wins. Dedup is case-insensitive (PyPI names are
+    case-insensitive)."""
+    parsed = parse_requirements_with_versions(
+        "PyYAML==5.4.1\nPyYAML==5.4.1\npyyaml==99.9.9\n"
+    )
+    assert parsed == [("PyYAML", "5.4.1")]
+
+
+def test_parse_requirements_with_versions_skips_url_and_vcs_installs():
+    """git+/http(s)/local-file refs aren't normal name==version specs;
+    we ignore them rather than guess. They'll surface in errors[] only
+    if a fully-named line is also missing."""
+    parsed = parse_requirements_with_versions(
+        "django==4.2.3\n"
+        "git+https://github.com/foo/bar.git\n"
+        "http://example.com/pkg.tar.gz\n"
+        "-e ./local-package\n"
+    )
+    assert parsed == [("django", "4.2.3")]
+
+
+# ---------------------------------------------------------------------------
+# _fetch_pypi_metadata — direct aiohttp-level error handling
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status: int, payload: dict | None = None):
+        self.status = status
+        self._payload = payload or {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    def __init__(self, response):
+        self._response = response
+
+    def get(self, url):
+        return self._response
+
+
+def test_fetch_pypi_metadata_success():
+    from nodes.sbom_node import _fetch_pypi_metadata
+    fixture = {
+        "info": {
+            "name": "Django",
+            "version": "4.2.3",
+            "license": "BSD-3-Clause",
+            "classifiers": [
+                "License :: OSI Approved :: BSD License",
+                "Programming Language :: Python :: 3",
+            ],
+        }
+    }
+    sem = asyncio.Semaphore(1)
+    session = _FakeSession(_FakeResponse(200, fixture))
+    r = _run(_fetch_pypi_metadata(session, sem, "Django", "4.2.3"))
+    assert r["success"] is True
+    assert r["error"] is None
+    assert r["name"] == "Django"
+    assert r["version"] == "4.2.3"
+    assert r["license_raw"] == "BSD-3-Clause"
+    assert r["license_classifiers"] == ["License :: OSI Approved :: BSD License"]
+
+
+def test_fetch_pypi_metadata_404():
+    from nodes.sbom_node import _fetch_pypi_metadata
+    sem = asyncio.Semaphore(1)
+    session = _FakeSession(_FakeResponse(404))
+    r = _run(_fetch_pypi_metadata(session, sem, "no-such-pkg", "1.0"))
+    assert r["success"] is False
+    assert "404" in (r["error"] or "")
+
+
+def test_fetch_pypi_metadata_timeout():
+    from nodes.sbom_node import _fetch_pypi_metadata
+
+    class _TimingOutSession:
+        def get(self, url):
+            class _Ctx:
+                async def __aenter__(self):
+                    raise asyncio.TimeoutError()
+                async def __aexit__(self, *_):
+                    return False
+            return _Ctx()
+
+    sem = asyncio.Semaphore(1)
+    r = _run(_fetch_pypi_metadata(_TimingOutSession(), sem, "django", "4.2.3"))
+    assert r["success"] is False
+    assert "timeout" in (r["error"] or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# _resolve_license_from_pypi — the priority chain
+# ---------------------------------------------------------------------------
+
+def test_resolve_license_clean_field():
+    assert _resolve_license_from_pypi("MIT", []) == "MIT"
+
+
+def test_resolve_license_empty_field_classifier_fallback():
+    assert _resolve_license_from_pypi(
+        "", ["License :: OSI Approved :: MIT License"]
+    ) == "MIT"
+
+
+def test_resolve_license_full_text_classifier_fallback():
+    """When info.license contains a multi-KB blob of the license text,
+    the >100-char guard kicks in and the classifier provides the
+    answer."""
+    huge_blob = "BSD 3-Clause License\n\n" + ("x" * 2000)
+    assert _resolve_license_from_pypi(
+        huge_blob, ["License :: OSI Approved :: BSD License"]
+    ) == "BSD-3-Clause"
+
+
+def test_resolve_license_multi_license_or():
+    """The compliance-safe GPL detection runs through normalize_license
+    first; for permissive OR permissive, the map handles it."""
+    assert _resolve_license_from_pypi("Apache-2.0 OR MIT", []) == "Apache-2.0"
+
+
+def test_resolve_license_returns_raw_when_unrecognized():
+    """If neither the field nor any classifier matches, fall back to the
+    raw string so LicenseNode can flag it as 'unknown' with the actual
+    text visible (better debugging than just None)."""
+    assert _resolve_license_from_pypi(
+        "Some Bespoke Internal License", []
+    ) == "Some Bespoke Internal License"
+
+
+def test_resolve_license_returns_none_when_nothing():
+    assert _resolve_license_from_pypi("", []) is None
+    assert _resolve_license_from_pypi(None, []) is None
+
+
+# ---------------------------------------------------------------------------
+# Classifier parser
+# ---------------------------------------------------------------------------
+
+def test_parse_classifier_extracts_last_segment():
+    assert _parse_classifier_to_license_string(
+        "License :: OSI Approved :: MIT License"
+    ) == "MIT License"
+    assert _parse_classifier_to_license_string(
+        "License :: OSI Approved :: BSD License"
+    ) == "BSD License"
+
+
+def test_parse_classifier_handles_single_segment():
+    assert _parse_classifier_to_license_string("MIT License") == "MIT License"
+
+
+# ---------------------------------------------------------------------------
+# SPDX normalization regressions for the spec's new map entries
+# ---------------------------------------------------------------------------
+
+def test_hpnd_normalization():
+    assert normalize_license("HPND") == ("HPND", True)
+    assert normalize_license(
+        "Historical Permission Notice and Disclaimer (HPND)"
+    ) == ("HPND", True)
+
+
+def test_lgpl_with_exceptions_normalization():
+    assert normalize_license("LGPL with exceptions") == ("LGPL-2.1-or-later", True)
+
+
+def test_apache_or_mit_normalization():
+    """Maps the canonical 'Apache-2.0 OR MIT' to the more conservative
+    Apache reading (existing map convention for permissive-OR-permissive
+    strings)."""
+    assert normalize_license("Apache-2.0 OR MIT") == ("Apache-2.0", True)
+
+
+def test_bsd3_or_apache_normalization():
+    assert normalize_license("BSD-3-Clause OR Apache-2.0") == (
+        "BSD-3-Clause", True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pre-existing normalization + GPL detection tests (still valid)
+# ---------------------------------------------------------------------------
 
 def test_spdx_normalization_for_common_license_strings():
     cases = [
@@ -176,12 +499,10 @@ def test_spdx_normalization_for_common_license_strings():
         assert recognized, f"{raw!r} should be recognized"
         assert spdx == expected, f"{raw!r} → {spdx!r}, expected {expected!r}"
 
-    # Unknown strings pass through with recognized=False
     unknown_value, unknown_recognized = normalize_license("Some Custom License")
     assert unknown_value == "Some Custom License"
     assert unknown_recognized is False
 
-    # Explicit empty / unknown / None sentinels collapse to None, recognized=True
     assert normalize_license("Unknown") == (None, True)
     assert normalize_license("") == (None, True)
     assert normalize_license(None) == (None, True)
@@ -201,44 +522,6 @@ git+https://github.com/foo/bar
     assert direct == {"django", "requests", "flask", "flask-cors"}
 
 
-def test_pipdeptree_failure_marks_status_failed():
-    def boom(*args, **kwargs):
-        cmd = args[0] if args else kwargs.get("args")
-        if cmd[0] == "pipdeptree":
-            raise subprocess.CalledProcessError(
-                returncode=1, cmd=cmd, output="", stderr="boom"
-            )
-        return _fake_subprocess(*args, **kwargs)
-
-    with patch("nodes.sbom_node.subprocess.run", side_effect=boom):
-        result = _run(sbom_node(_state()))
-
-    assert result["status"] == "failed"
-    assert result["packages"] == []
-    assert any(e["event_type"] == "sbom_failed" for e in result["audit_events"])
-
-
-def test_l1_cache_hit_increments_counter_and_populates_record():
-    l1_cache.set("Django", "4.2.3", license="BSD-3-Clause", cves=[{"id": "CVE-test"}])
-
-    with patch("nodes.sbom_node.subprocess.run", side_effect=_fake_subprocess):
-        result = _run(sbom_node(_state()))
-
-    sbom_event = next(
-        e for e in result["audit_events"] if e["event_type"] == "sbom_resolved"
-    )
-    assert sbom_event["payload"]["cache_hits"] == 1
-
-    django = next(p for p in result["packages"] if p["name"].lower() == "django")
-    assert django["from_cache"] is True
-    assert django["cached_at"] is not None
-    assert django["cves"] == [{"id": "CVE-test"}]
-
-
-# ---------------------------------------------------------------------------
-# Bug B: expanded LICENSE_NORMALIZATION mappings
-# ---------------------------------------------------------------------------
-
 def test_normalization_handles_real_world_pip_licenses_strings():
     cases = [
         ("Apache License 2.0", "Apache-2.0"),
@@ -257,10 +540,6 @@ def test_normalization_handles_real_world_pip_licenses_strings():
         assert spdx == expected, f"{raw!r} → {spdx!r}, expected {expected!r}"
 
 
-# ---------------------------------------------------------------------------
-# Bug C: GPL detection in multi-license strings (compliance correctness)
-# ---------------------------------------------------------------------------
-
 def test_artistic_plus_gpl_plus_gplv2plus_detected_as_gpl_2_or_later():
     raw = ("Artistic License; GNU General Public License (GPL); "
            "GNU General Public License v2 or later (GPLv2+)")
@@ -271,7 +550,6 @@ def test_artistic_plus_gpl_plus_gplv2plus_detected_as_gpl_2_or_later():
 
 
 def test_apache_plus_gpl_plus_lgpl_does_not_hide_gpl():
-    # LGPL is co-listed but the standalone GPL mention still triggers detection.
     raw = ("Apache Software License; GNU General Public License (GPL); "
            "GNU Library or Lesser General Public License (LGPL)")
     detected = _detect_gpl_in_multi_license(raw)
@@ -280,7 +558,6 @@ def test_apache_plus_gpl_plus_lgpl_does_not_hide_gpl():
 
 
 def test_pure_lgpl_does_not_trigger_gpl_detection():
-    # Various phrasings that mean LGPL only — no real GPL mention.
     assert _detect_gpl_in_multi_license("LGPL-2.1-only") is None
     assert _detect_gpl_in_multi_license("GNU Lesser General Public License (LGPL)") is None
     assert _detect_gpl_in_multi_license(
@@ -289,11 +566,11 @@ def test_pure_lgpl_does_not_trigger_gpl_detection():
 
 
 def test_agpl_always_detected_even_single_license():
-    # AGPL is severe enough that the conservative interpretation applies
-    # even for single-license strings (no semicolon or "or" separator).
     assert _detect_gpl_in_multi_license("AGPL-3.0-only") == "AGPL-3.0-or-later"
     assert _detect_gpl_in_multi_license("AGPL-3.0-or-later") == "AGPL-3.0-or-later"
-    assert _detect_gpl_in_multi_license("GNU Affero General Public License v3") == "AGPL-3.0-or-later"
+    assert _detect_gpl_in_multi_license(
+        "GNU Affero General Public License v3"
+    ) == "AGPL-3.0-or-later"
 
     spdx, recognized = normalize_license("AGPL-3.0-only")
     assert recognized is True
@@ -301,9 +578,6 @@ def test_agpl_always_detected_even_single_license():
 
 
 def test_single_license_gplv2_still_maps_precisely_via_normalization_map():
-    # Single-license "GPLv2" stays GPL-2.0-only — detection does NOT
-    # downgrade to the conservative "or-later" reading for single-license
-    # inputs (only multi-license triggers that).
     spdx, recognized = normalize_license("GNU General Public License v2 (GPLv2)")
     assert recognized is True
     assert spdx == "GPL-2.0-only"
@@ -315,24 +589,5 @@ def test_gpl_v3_detected_from_multi_license():
 
 
 def test_generic_gpl_in_multi_license_assumes_most_restrictive():
-    # Generic "GPL" mention with no version in a multi-license declaration.
     raw = "MIT; GNU General Public License (GPL)"
     assert _detect_gpl_in_multi_license(raw) == "GPL-3.0-or-later"
-
-
-# ---------------------------------------------------------------------------
-# Original test (kept below as final sbom integration check)
-# ---------------------------------------------------------------------------
-
-def test_include_transitive_false_filters_out_indirect_packages():
-    policy = {
-        "scan_defaults": {"include_transitive": False},
-        "policy_hash": "test",
-    }
-    with patch("nodes.sbom_node.subprocess.run", side_effect=_fake_subprocess):
-        result = _run(sbom_node(_state(policy=policy)))
-
-    assert result["status"] == "running"
-    names = {p["name"].lower() for p in result["packages"]}
-    assert names == {"django", "requests"}
-    assert all(p["transitive"] is False for p in result["packages"])
