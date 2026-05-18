@@ -124,19 +124,63 @@ licenses:
     - "CC0-1.0"
     - "WTFPL"             # yes, it's a real SPDX identifier
 
-  # Licenses explicitly blocked regardless of use_case.
-  # Findings for packages with these licenses are always CRITICAL severity
-  # and always route to HUMAN_REVIEW. No auto-remediation.
+  # Licenses explicitly blocked, keyed by use_case. A package whose
+  # SPDX license string matches an entry in blocked[use_case] produces
+  # a CRITICAL "license_violation" finding routed to HUMAN_REVIEW.
+  # No auto-remediation.
+  #
+  # The use-case-aware design (introduced 2026-05-18, resolves BUGS.md
+  # P1 USE_CASE INVESTIGATION) replaces the previous flat list. Rationale:
+  # copyleft obligations under GPL/AGPL/LGPL are triggered by
+  # distribution model, not by the license alone.
+  #
+  #   - "saas" — software delivered over the network. GPL/AGPL trigger
+  #     the network-use-as-distribution clause (AGPL) and the
+  #     distribution-of-derivative-works clause (GPL) for any deployment
+  #     a user can reach. Block both. LGPL is reviewable (linking model
+  #     affects whether it triggers) — leave it on requires_review for
+  #     LLM-driven analysis.
+  #   - "internal" — internal tooling, never distributed to outside
+  #     parties. No distribution event → no copyleft trigger. Empty
+  #     blocked list; non-distributed-internal copyleft works are
+  #     compatible with the SPDX terms.
+  #   - "distributed_binary" — software shipped to end users as an
+  #     installable. Strongest copyleft exposure: GPL forces source
+  #     disclosure, AGPL applies even for network use of bundled
+  #     services, LGPL forces user-relinkability that may be
+  #     incompatible with proprietary binary builds. Block all three.
+  #
+  # Adding a new license to a use_case's blocked list immediately
+  # promotes findings for that license to CRITICAL on subsequent scans
+  # (policy_hash changes, L2 memo replays bypass-friendly).
   blocked:
-    - "GPL-2.0-only"
-    - "GPL-2.0-or-later"
-    - "GPL-3.0-only"
-    - "GPL-3.0-or-later"
-    - "AGPL-3.0-only"
-    - "AGPL-3.0-or-later"
-    - "SSPL-1.0"          # MongoDB's non-OSI license, functionally AGPL-like
-    - "BUSL-1.1"          # Business Source License — not OSI-approved
-    - "Commons-Clause"    # Not an SPDX license but appears in the wild
+    saas:
+      - "GPL-2.0-only"
+      - "GPL-2.0-or-later"
+      - "GPL-3.0-only"
+      - "GPL-3.0-or-later"
+      - "AGPL-3.0-only"
+      - "AGPL-3.0-or-later"
+      - "SSPL-1.0"          # MongoDB's non-OSI license, functionally AGPL-like
+      - "BUSL-1.1"          # Business Source License — not OSI-approved
+      - "Commons-Clause"    # Not an SPDX license but appears in the wild
+    internal: []
+    distributed_binary:
+      - "GPL-2.0-only"
+      - "GPL-2.0-or-later"
+      - "GPL-3.0-only"
+      - "GPL-3.0-or-later"
+      - "AGPL-3.0-only"
+      - "AGPL-3.0-or-later"
+      - "LGPL-2.0-only"
+      - "LGPL-2.0-or-later"
+      - "LGPL-2.1-only"
+      - "LGPL-2.1-or-later"
+      - "LGPL-3.0-only"
+      - "LGPL-3.0-or-later"
+      - "SSPL-1.0"
+      - "BUSL-1.1"
+      - "Commons-Clause"
 
   # Licenses that require LLM reasoning before a decision is made.
   # If a license is not on allowed or blocked, it falls through to LLM analysis.

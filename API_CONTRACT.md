@@ -381,8 +381,8 @@ RESPONSE 200 OK:
             {
               "source": "policy",
               "url": null,
-              "identifier": "policy.licenses.blocked[0]",
-              "excerpt": "GPL-2.0-only is in the organization blocked license list.",
+              "identifier": "policy.licenses.blocked.saas[GPL-2.0-only]",
+              "excerpt": "GPL-2.0-only is in the organization's blocked license list for use_case='saas'.",
               "retrieved_at": "2026-05-13T14:32:05Z",
               "confidence": "authoritative",
               "validated": true,

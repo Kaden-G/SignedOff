@@ -37,9 +37,16 @@ reproductions. Headline status:
   regression test added in `tests/test_api.py`. Real repo URL
   ingestion is v1.1 roadmap.
 
-Suite after fixes: 178 passed (175 pre-fix + 2 audit_node tests +
-1 repo_url rejection test). See also `## USE_CASE INVESTIGATION —
-2026-05-18` below for the P1 follow-up scoping.
+- **P1 (use_case threading in LicenseNode) — RESOLVED.** Design 1
+  applied: `licenses.blocked` is now a dict keyed by use_case. GPL-3.0
+  + use_case=internal no longer fires CRITICAL (the blocked fast-path
+  is skipped because `blocked.internal == []`). Audit-traceable via
+  the new `policy.licenses.blocked.{use_case}[{license_id}]` citation
+  identifier. Backward compat preserved for legacy flat-list policies.
+  See `## ✅ USE_CASE INVESTIGATION — 2026-05-18 (RESOLVED)` below.
+
+Suite after fixes: 193 passed (175 v1.0-final + 3 P0 regression tests
++ 15 use_case matrix tests).
 
 ---
 
@@ -403,7 +410,50 @@ green.
 
 ---
 
-## USE_CASE INVESTIGATION — 2026-05-18
+## ✅ USE_CASE INVESTIGATION — 2026-05-18 (RESOLVED)
+
+**Status:** **RESOLVED** by Design 1 — per-use_case policy schema.
+Pre-fix state tagged `v1.0-design1-pre`. Fix in the commit
+immediately following this update.
+
+**What changed:**
+- `POLICY.yml`: `licenses.blocked` is now a dict keyed by use_case
+  (`saas`, `internal`, `distributed_binary`). `internal` is empty by
+  design — non-distributed deployments don't trigger copyleft.
+- `nodes/license_node.py`: new `_blocked_for_use_case()` helper dispatches
+  on `isinstance(blocked, dict)`. Legacy flat-list policies still work
+  as a universal block (backward compat path is tested).
+- Policy citation identifier on blocked findings now includes the
+  use_case path — `policy.licenses.blocked.{use_case}[{license_id}]` —
+  so auditors can trace the exact rule that fired.
+- Description text on blocked findings now references the use_case
+  explicitly: "Your declared use_case='saas' blocks this license per
+  organization policy. Copyleft / distribution obligations under this
+  license are likely to apply to your deployment model."
+- `input_node.py` SAFE_DEFAULTS mirrors the new schema; the input_node
+  test was updated to assert on the dict shape.
+- 15 new tests added in `tests/test_license_node.py`:
+  - GPL-3.0 / AGPL-3.0 across all three use_cases (CRITICAL for
+    saas + distributed, NOT-CRITICAL for internal)
+  - LGPL-3.0 across all three (CRITICAL for distributed_binary only;
+    saas/internal fall through to LLM)
+  - MIT under all three (no finding)
+  - Citation identifier includes the use_case path
+  - Citation identifier distinguishes use_cases (same license,
+    different identifiers)
+  - Legacy flat-list policies still trigger CRITICAL under all
+    use_cases (backward compat)
+
+**Audit trail story:** the policy_hash recomputation triggered by
+the POLICY.yml restructure forces a clean L2 memo re-evaluation,
+which is the intended behavior — prior decisions encoded under the
+old schema shouldn't transparently apply to the new one.
+
+Original analysis preserved below for posterity.
+
+---
+
+## USE_CASE INVESTIGATION — 2026-05-18 (original analysis)
 
 Scoping report for the P1 from the smoke test:
 > "use_case=internal does NOT downgrade GPL findings in LicenseNode.

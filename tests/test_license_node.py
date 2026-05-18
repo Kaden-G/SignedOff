@@ -41,7 +41,19 @@ def _pkg(name: str = "somepkg", version: str = "1.0.0", license_id: str | None =
 _DEFAULT_POLICY = {
     "licenses": {
         "allowed": ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC"],
-        "blocked": ["GPL-3.0-only", "GPL-2.0-only", "AGPL-3.0-only"],
+        # Post-Design-1 (2026-05-18) per-use_case schema. The "saas"
+        # key here matches the use_case=saas default in _state(), so
+        # the existing baseline tests continue to exercise the same
+        # blocked-licenses set they did before. The other use_cases
+        # are covered by the explicit per-use_case matrix tests below.
+        "blocked": {
+            "saas": ["GPL-3.0-only", "GPL-2.0-only", "AGPL-3.0-only"],
+            "internal": [],
+            "distributed_binary": [
+                "GPL-3.0-only", "GPL-2.0-only", "AGPL-3.0-only",
+                "LGPL-3.0-only", "LGPL-2.1-only",
+            ],
+        },
         "requires_review": ["LGPL-2.1-only", "LGPL-3.0-only", "MPL-2.0"],
         "unknown_license_action": "human_review",
     },
@@ -404,3 +416,222 @@ def test_license_not_in_spdx_dataset_treated_as_unknown(monkeypatch):
     f = result["license_findings"][0]
     assert f["finding_type"] == "license_unknown"
     assert f["decision_status"] == DecisionStatus.HUMAN_REVIEW
+
+
+# ---------------------------------------------------------------------------
+# Per-use_case blocked lookup (Design 1 — 2026-05-18)
+#
+# These tests lock the new "blocked is a dict keyed by use_case" schema
+# from POLICY.yml. The matrix below mirrors BUGS.md USE_CASE INVESTIGATION
+# Task 4 spec. Resolves the P1 use_case bug from the 2026-05-17 smoke test:
+# pre-fix, GPL/AGPL/LGPL findings were CRITICAL regardless of use_case.
+# ---------------------------------------------------------------------------
+
+def _patch_llm_no(monkeypatch):
+    """Patch the license-reasoning LLM to a deterministic 'incompatible'
+    verdict. The matrix tests exercise the BLOCKED fast-path only; this
+    stub guards against any fall-through that hits the LLM (which would
+    require network + API key in a unit test)."""
+    async def fake_llm(license_spdx, use_case, spdx_entry):
+        return {
+            "compatible": "no",
+            "conditions": None,
+            "risk_level": "high",
+            "explanation": "stub: incompatible",
+        }
+    monkeypatch.setattr(ln_mod, "_call_llm_for_license_reasoning", fake_llm)
+
+
+def _run_matrix(monkeypatch, license_id: str, use_case: str) -> dict | None:
+    """Run license_node for one (license, use_case) cell. Returns the
+    single Finding (or None when license_node produced no finding)."""
+    _stub_loaders(monkeypatch)
+    _patch_llm_no(monkeypatch)
+    pkg = _pkg(name="somepkg", version="1.0.0", license_id=license_id)
+    result = _run(license_node(_state([pkg], use_case=use_case)))
+    findings = result["license_findings"]
+    if not findings:
+        return None
+    assert len(findings) == 1
+    return findings[0]
+
+
+# --- GPL-3.0-only across all three use_cases ---
+
+def test_gpl3_saas_produces_critical_violation(monkeypatch):
+    f = _run_matrix(monkeypatch, "GPL-3.0-only", "saas")
+    assert f is not None
+    assert f["finding_type"] == "license_violation"
+    assert f["severity"] == RiskLevel.CRITICAL
+    assert f["use_case"] == "saas"
+
+
+def test_gpl3_internal_produces_no_blocked_violation(monkeypatch):
+    """internal use_case has [] blocked — GPL-3.0 falls through past the
+    blocked fast-path. Stubbed LLM returns 'no' so we still get a finding
+    via the requires_review path (LGPL-3.0-only is on requires_review
+    but GPL-3.0-only isn't — it's neither allowed nor blocked for
+    internal, so it falls through SPDX → LLM)."""
+    f = _run_matrix(monkeypatch, "GPL-3.0-only", "internal")
+    # Whatever path it took, it must NOT be the blocked fast-path —
+    # severity != CRITICAL (the LLM path on stubbed "no" produces
+    # severity HIGH via risk_level="high"), and the citation list
+    # must NOT contain the policy.licenses.blocked.* identifier.
+    if f is not None:
+        assert f["severity"] != RiskLevel.CRITICAL, (
+            f"GPL-3.0 under use_case=internal should NOT be CRITICAL "
+            f"(the blocked fast-path must not fire). Finding: {f}"
+        )
+        for c in f["citations"]:
+            assert not str(c.get("identifier", "")).startswith(
+                "policy.licenses.blocked"
+            ), f"blocked-path citation fired for internal use_case: {c}"
+
+
+def test_gpl3_distributed_binary_produces_critical_violation(monkeypatch):
+    f = _run_matrix(monkeypatch, "GPL-3.0-only", "distributed_binary")
+    assert f is not None
+    assert f["finding_type"] == "license_violation"
+    assert f["severity"] == RiskLevel.CRITICAL
+    assert f["use_case"] == "distributed_binary"
+
+
+# --- AGPL-3.0-only across all three use_cases ---
+
+def test_agpl3_saas_produces_critical_violation(monkeypatch):
+    f = _run_matrix(monkeypatch, "AGPL-3.0-only", "saas")
+    assert f is not None
+    assert f["severity"] == RiskLevel.CRITICAL
+
+
+def test_agpl3_internal_does_not_fire_blocked_path(monkeypatch):
+    f = _run_matrix(monkeypatch, "AGPL-3.0-only", "internal")
+    if f is not None:
+        assert f["severity"] != RiskLevel.CRITICAL
+        for c in f["citations"]:
+            assert not str(c.get("identifier", "")).startswith(
+                "policy.licenses.blocked"
+            )
+
+
+def test_agpl3_distributed_binary_produces_critical_violation(monkeypatch):
+    f = _run_matrix(monkeypatch, "AGPL-3.0-only", "distributed_binary")
+    assert f is not None
+    assert f["severity"] == RiskLevel.CRITICAL
+
+
+# --- LGPL-3.0-only: requires_review path for saas/internal, blocked for distributed ---
+
+def test_lgpl3_distributed_binary_produces_critical_violation(monkeypatch):
+    """LGPL only joins the blocked list for distributed_binary — the
+    binary linking model can be incompatible with LGPL's relinkability
+    requirement."""
+    f = _run_matrix(monkeypatch, "LGPL-3.0-only", "distributed_binary")
+    assert f is not None
+    assert f["finding_type"] == "license_violation"
+    assert f["severity"] == RiskLevel.CRITICAL
+
+
+def test_lgpl3_saas_does_not_fire_blocked_path(monkeypatch):
+    """LGPL-3.0 isn't blocked for saas — it's on requires_review, so it
+    falls through to the LLM-reasoning path. Stubbed LLM returns 'no' →
+    a license_violation finding gets created via the requires_review
+    path, NOT the blocked fast-path. Severity comes from the LLM
+    (risk_level='high' → HIGH), NOT the hardcoded CRITICAL from blocked."""
+    f = _run_matrix(monkeypatch, "LGPL-3.0-only", "saas")
+    if f is not None:
+        # If the LLM path produced a finding, severity reflects
+        # risk_level="high" — not the CRITICAL hardcoded by the
+        # blocked path.
+        assert f["severity"] != RiskLevel.CRITICAL or "blocked" not in str(
+            [c.get("identifier") for c in f["citations"]]
+        )
+
+
+def test_lgpl3_internal_does_not_fire_blocked_path(monkeypatch):
+    f = _run_matrix(monkeypatch, "LGPL-3.0-only", "internal")
+    if f is not None:
+        for c in f["citations"]:
+            assert not str(c.get("identifier", "")).startswith(
+                "policy.licenses.blocked"
+            )
+
+
+# --- MIT: always allowed, no finding under any use_case ---
+
+def test_mit_produces_no_finding_under_saas(monkeypatch):
+    f = _run_matrix(monkeypatch, "MIT", "saas")
+    assert f is None
+
+
+def test_mit_produces_no_finding_under_internal(monkeypatch):
+    f = _run_matrix(monkeypatch, "MIT", "internal")
+    assert f is None
+
+
+def test_mit_produces_no_finding_under_distributed_binary(monkeypatch):
+    f = _run_matrix(monkeypatch, "MIT", "distributed_binary")
+    assert f is None
+
+
+# --- Citation identifier includes use_case path for audit traceability ---
+
+def test_blocked_citation_identifier_includes_use_case(monkeypatch):
+    """The policy citation on a blocked finding must name the
+    per-use_case path so auditors can trace the exact rule. This is the
+    audit-traceability contract documented in the BUGS.md design 1 fix."""
+    f = _run_matrix(monkeypatch, "GPL-3.0-only", "saas")
+    assert f is not None
+    policy_cit = next(
+        c for c in f["citations"]
+        if c["source"] == CitationSource.POLICY
+    )
+    assert policy_cit["identifier"] == (
+        "policy.licenses.blocked.saas[GPL-3.0-only]"
+    )
+    assert "use_case='saas'" in policy_cit["excerpt"]
+
+
+def test_blocked_citation_identifier_distinguishes_use_cases(monkeypatch):
+    """Same license, different use_cases → different citation identifiers."""
+    saas_f = _run_matrix(monkeypatch, "GPL-3.0-only", "saas")
+    db_f = _run_matrix(monkeypatch, "GPL-3.0-only", "distributed_binary")
+    saas_id = next(
+        c["identifier"] for c in saas_f["citations"]
+        if c["source"] == CitationSource.POLICY
+    )
+    db_id = next(
+        c["identifier"] for c in db_f["citations"]
+        if c["source"] == CitationSource.POLICY
+    )
+    assert "saas" in saas_id and "distributed_binary" in db_id
+    assert saas_id != db_id
+
+
+# --- Backward compat: legacy flat-list policies still work ---
+
+def test_legacy_flat_blocked_list_still_applies_universally(monkeypatch):
+    """For callers that haven't updated to the per-use_case schema (e.g.
+    test fixtures, policy_override that still passes a flat list), the
+    flat shape is honored as a universal block — same behavior as
+    pre-Design-1. Documents the backward-compat path in
+    _blocked_for_use_case."""
+    _stub_loaders(monkeypatch)
+    _patch_llm_no(monkeypatch)
+    legacy_policy = {
+        "licenses": {
+            "allowed": ["MIT"],
+            "blocked": ["GPL-3.0-only"],  # flat list, NOT a dict
+            "requires_review": [],
+            "unknown_license_action": "human_review",
+        },
+        "policy_hash": "legacy",
+    }
+    pkg = _pkg(name="x", version="1", license_id="GPL-3.0-only")
+    for uc in ("saas", "internal", "distributed_binary"):
+        result = _run(license_node(_state([pkg], use_case=uc, policy=legacy_policy)))
+        f = result["license_findings"][0]
+        assert f["severity"] == RiskLevel.CRITICAL, (
+            f"legacy flat blocked list should fire under all use_cases; "
+            f"failed for use_case={uc}"
+        )

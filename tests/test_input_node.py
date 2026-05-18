@@ -74,9 +74,18 @@ def test_missing_policy_yml_uses_safe_defaults(monkeypatch, tmp_path):
 
     assert result["status"] == "running"
     assert result["policy"]["policy_hash"] == "defaults"
-    # Safe defaults preserve the structure RiskNode expects.
+    # Safe defaults preserve the structure RiskNode expects. The
+    # blocked field is a dict keyed by use_case under the post-Design-1
+    # schema (2026-05-18); GPL-3.0 is blocked for the saas + distributed
+    # use cases and absent from internal.
     assert "MIT" in result["policy"]["licenses"]["allowed"]
-    assert "GPL-3.0-only" in result["policy"]["licenses"]["blocked"]
+    blocked = result["policy"]["licenses"]["blocked"]
+    assert isinstance(blocked, dict), (
+        "SAFE_DEFAULTS.licenses.blocked should be a per-use_case dict"
+    )
+    assert "GPL-3.0-only" in blocked["saas"]
+    assert "GPL-3.0-only" in blocked["distributed_binary"]
+    assert blocked["internal"] == []
 
     assert len(result["errors"]) == 1
     assert "not found" in result["errors"][0].lower()
