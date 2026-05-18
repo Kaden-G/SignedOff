@@ -34,8 +34,8 @@ hash-chained audit trail.
 ## Quick Start
 
 ```bash
-git clone https://github.com/Kaden-G/lablab-prep.git
-cd lablab-prep
+git clone https://github.com/Kaden-G/SignedOff.git
+cd SignedOff
 
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
