@@ -10,27 +10,36 @@ identified during v1 development. Issues are categorized by severity:
 
 ---
 
-## ⚠️ PRE-DEPLOY ALERT (2026-05-17 evening smoke test)
+## ✅ PRE-DEPLOY ALERT (2026-05-17 smoke test → 2026-05-18 fixes)
 
 The v1.0-final tag `v1.0-backend-complete` (commit `83f2dcf`, 175 tests
 passing) was smoke-tested against three previously-unverified input
-paths. **Two P0 issues surfaced; a follow-up session is required before
-public deploy.** See `## Smoke Test Results (2026-05-17 evening)`
-below for full reproductions. Headline issues:
+paths. Two P0 issues surfaced. **Both resolved on 2026-05-18.** Pre-fix
+state preserved at tag `v1.0-final-pre-p0` for rollback. See
+`## Smoke Test Results (2026-05-17 evening)` below for the original
+reproductions. Headline status:
 
-- **P0** — Audit chain seals after the FIRST decision is submitted,
-  even when 41 of 42 HITL findings are still undecided. `status` flips
-  to `"complete"` prematurely. Demo-blocking for the HITL-arc and the
-  Verify-Chain-Now mic-drop. Same join-barrier pattern that needed
-  `defer=True` on `risk_node` (commit `47f30e1`); `audit_node` is
-  missing the same flag.
-- **P0** — `input_type="repo_url"` is accepted by `/scan/start` but
-  the URL is never fetched. SBOMNode falls back to the server's
-  running venv and returns those findings as if they belonged to the
-  requested repo. A user pointing the API at, say,
-  `pallets/flask` gets back SignedOff's own dependencies. Dashboard
-  doesn't expose repo_url currently, so demo risk is low **iff demo
-  stays on the UI path** — but the API itself returns misleading data.
+- **P0a — RESOLVED (commit `f240469`).** Audit chain sealed after the
+  first decision when 41 of 42 HITL findings were still undecided;
+  `status` flipped to `"complete"` prematurely. Fixed by adding
+  `defer=True` to `audit_node` registration in `graph.py`, mirroring
+  the `risk_node` fix from `47f30e1`. Two regression tests added in
+  `tests/test_graph_topology.py` (source-contract check +
+  behavioral test that submits one decision out of three and asserts
+  the audit chain does NOT seal).
+- **P0b — RESOLVED (commit `c285613`).** `input_type="repo_url"` was
+  accepted but the URL was never fetched; SBOMNode returned the
+  server's venv as findings. Fixed by dropping `repo_url` from the
+  `Literal` in `api.py`'s `ScanStartRequest`. Callers now get 422
+  with `msg: "Input should be 'requirements_file'"`. Defense-in-depth
+  check added to `nodes/input_node.py`'s `VALID_INPUT_TYPES`
+  frozenset. Dead branch in `nodes/sbom_node.py` removed. One
+  regression test added in `tests/test_api.py`. Real repo URL
+  ingestion is v1.1 roadmap.
+
+Suite after fixes: 178 passed (175 pre-fix + 2 audit_node tests +
+1 repo_url rejection test). See also `## USE_CASE INVESTIGATION —
+2026-05-18` below for the P1 follow-up scoping.
 
 ---
 
@@ -387,3 +396,166 @@ citations. P2 polish for the citation integrity story.
 repo_url case is mitigated by the dashboard NOT exposing the
 endpoint — but if any external demo touches the API directly,
 reject `repo_url` at the validation layer.
+
+**Update 2026-05-18:** Both P0s resolved (commits `f240469`,
+`c285613`). See PRE-DEPLOY ALERT at the top of this file. 178 tests
+green.
+
+---
+
+## USE_CASE INVESTIGATION — 2026-05-18
+
+Scoping report for the P1 from the smoke test:
+> "use_case=internal does NOT downgrade GPL findings in LicenseNode.
+> text-unidecode (GPL-2.0) + odfpy (GPL-2.0) stay CRITICAL violations
+> under both saas and internal. Severity counts are byte-for-byte
+> identical between the two scans."
+
+**Discovery only — no code changes in this session.**
+
+### Verdict: **Reality B with a nuance.**
+
+use_case IS plumbed all the way through LicenseNode and DOES reach
+the LLM prompt for the gray-area / requires_review path. **But the
+specific code path that produces the CRITICAL findings on GPL/AGPL
+packages (the `policy.licenses.blocked` fast-path) bypasses use_case
+entirely and hardcodes `RiskLevel.CRITICAL`.** It's not a missing
+LLM branch — it's a policy-design choice in POLICY.yml combined
+with a hardcoded severity in `_evaluate_blocked()`.
+
+### Evidence
+
+**1. `use_case` IS threaded through every LicenseNode helper.**
+`grep -c use_case nodes/license_node.py` returns 24 matches. It's
+on every `_evaluate_*` function signature, threaded into the
+`_make_finding(...)` factory as a stamped field, and is the second
+positional argument to `_call_llm_for_license_reasoning()`.
+
+**2. `use_case` IS in the LLM prompt.**
+`nodes/license_node.py:227-249` (`LLM_PROMPT_TEMPLATE`):
+```text
+The organization's declared use case is: {use_case}
+...
+1. Is this license compatible with the {use_case} use case? (yes/no/conditional)
+```
+So for LGPL-3.0 / MPL-2.0 / CDDL-1.0 / EPL / EUPL findings — the
+ones on the `licenses.requires_review` list — use_case genuinely
+shapes the verdict.
+
+**3. The blocked-license fast-path skips the LLM AND hardcodes
+CRITICAL.** `nodes/license_node.py:331-380` `_evaluate_blocked()`:
+```python
+def _evaluate_blocked(pkg, license_id, use_case, spdx_dataset, curated):
+    ...
+    return _make_finding(
+        pkg,
+        finding_type="license_violation",
+        severity=RiskLevel.CRITICAL,   # ← hardcoded, ignores use_case
+        description=(
+            f"{license_id} detected. Use case {use_case!r} is incompatible "
+            f"with this license per organization policy."   # ← description LIES for internal
+        ),
+        ...
+    )
+```
+For `use_case=internal`, the description text says the use case is
+"incompatible with this license per organization policy" — but the
+copyleft obligations of GPL only trigger on distribution. For
+internal/non-distributed deployments, GPL is generally permissible.
+The severity stays CRITICAL anyway because the function doesn't read
+use_case for the severity decision.
+
+**4. POLICY.yml encodes this as a deliberate policy.**
+`POLICY.yml:127-139`:
+```yaml
+# Licenses explicitly blocked regardless of use_case.
+# Findings for packages with these licenses are always CRITICAL severity
+# and always route to HUMAN_REVIEW. No auto-remediation.
+blocked:
+  - "GPL-2.0-only"
+  - "GPL-2.0-or-later"
+  - "GPL-3.0-only"
+  - "GPL-3.0-or-later"
+  - "AGPL-3.0-only"
+  - "AGPL-3.0-or-later"
+  ...
+```
+The comment "regardless of use_case" + "always CRITICAL" matches
+LicenseNode's behavior exactly. So the LicenseNode code is
+faithful to the policy file — the bug is in the policy design,
+not in the implementation.
+
+**5. There is no existing per-use_case override mechanism.**
+POLICY.yml's `licenses:` section has three flat lists (`allowed`,
+`blocked`, `requires_review`) and an `unknown_license_action`
+scalar. None of these key on use_case. `policy_overrides` (the
+field hashed into policy_hash for L2 memoization) is a top-level
+override but operates at the same flat-list granularity.
+
+### Two viable fixes (NOT applied — pick before scheduling)
+
+**Design 1 — Per-use_case blocked lists in POLICY.yml (more
+correct, more invasive).**
+Restructure `licenses.blocked` from a flat list into either a dict
+keyed by use_case:
+```yaml
+licenses:
+  blocked:
+    saas:               [GPL-2.0-only, GPL-3.0-only, AGPL-3.0-only, ...]
+    internal:           [AGPL-3.0-only]   # AGPL still triggers via network
+    distributed_binary: [GPL-2.0-only, GPL-3.0-only, AGPL-3.0-only, ...]
+```
+or a parallel `blocked_for_use_case` mapping. Modify
+`_evaluate_license()` to look up the current use_case before
+dispatching to `_evaluate_blocked()`. For `internal`, GPL would
+fall through to the LLM-reasoning path which already takes
+use_case into account, producing a context-aware verdict.
+
+Estimated effort:
+- POLICY.yml restructure + backward-compat parsing: ~1h
+- LicenseNode dispatch update: ~30min
+- New tests (per-use_case blocking behavior, AGPL-stays-blocked-for-saas
+  invariant): ~1h
+- Documentation in POLICY.yml comments + DESIGN.md: ~30min
+- **Total: ~3h**
+
+**Design 2 — Severity downgrade for use_case=internal in
+_evaluate_blocked() (cheaper, more brittle).**
+Keep `licenses.blocked` flat. In `_evaluate_blocked()`, after the
+fast-path matches, check `if use_case == "internal" and license_id
+in COPYLEFT_INTERNAL_OK_SET: ...` and downgrade severity to
+MEDIUM with `finding_type="license_restricted"`. Hardcoded list
+of copyleft-distribution-only licenses lives in license_node.py.
+
+Estimated effort:
+- LicenseNode logic: ~20min
+- Tests: ~30min
+- DESIGN.md note: ~10min
+- **Total: ~1h**
+
+### Recommendation
+
+**Design 1** if there's time before the demo. It's the
+policy-driven approach the comment block in POLICY.yml implies
+should exist, and it generalizes — e.g. for `distributed_binary`,
+LGPL might need stricter treatment than for `saas`. The L2
+memoization key already includes `policy_hash`, so restructuring
+the policy bumps the hash and forces a clean re-evaluation
+(intentional).
+
+**Design 2** if shipping today and the policy structure work is
+out of scope. Add a TODO in license_node.py pointing at this
+section.
+
+### Out of scope for this investigation
+
+- The CVE contextualization path uses a separate LLM prompt
+  (`nodes/risk_node.py::_call_llm_for_cve_context`) that ALSO
+  receives `use_case`. The smoke test couldn't verify whether the
+  use_case STRING reaches that prompt because the .env in the
+  smoke environment had `ANTHROPIC_API_KEY=` (empty). Production
+  needs a re-run with a real key to confirm the CVE side, but the
+  source code threading looks correct.
+- The "the description text lies for internal" wording bug (point
+  3 above) is a P2 cosmetic regardless of which design wins. Flag
+  it for follow-up.
