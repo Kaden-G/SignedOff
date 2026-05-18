@@ -98,6 +98,33 @@ def test_post_scan_start_empty_input_value_returns_422(client):
     assert resp.status_code == 422
 
 
+def test_post_scan_start_repo_url_rejected_with_clear_422(client):
+    """
+    Regression: repo_url was previously a valid input_type but the
+    SBOMNode branch never implemented real cloning — it silently
+    returned the server's running venv as the scan result (BUGS.md
+    P0, 2026-05-17 smoke test). The API now rejects repo_url at the
+    validation layer until real cloning lands in v1.1.
+    """
+    resp = client.post("/scan/start", json={
+        "input_type": "repo_url",
+        "input_value": "https://github.com/example/repo",
+        "use_case": "saas",
+    })
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    # FastAPI returns a list of validation errors; find the input_type one.
+    type_err = next(
+        (e for e in detail if e.get("loc", [])[-1:] == ["input_type"]),
+        None,
+    )
+    assert type_err is not None, f"no input_type error in {detail}"
+    assert type_err["input"] == "repo_url"
+    # The 422 message must name the accepted value so a caller can fix
+    # the request without consulting docs.
+    assert "requirements_file" in type_err["msg"]
+
+
 # ---------------------------------------------------------------------------
 # GET /scan/status
 # ---------------------------------------------------------------------------

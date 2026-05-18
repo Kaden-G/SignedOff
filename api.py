@@ -74,7 +74,21 @@ def _now_iso() -> str:
 # ---------------------------------------------------------------------------
 
 class ScanStartRequest(BaseModel):
-    input_type: Literal["requirements_file", "repo_url"]
+    # "repo_url" was previously a valid input_type but the SBOMNode branch
+    # for it never implemented actual cloning — it silently returned the
+    # server's running venv as if those packages belonged to the requested
+    # repo (BUGS.md P0, 2026-05-17 smoke test). Dropping it from the Literal
+    # makes /scan/start return 422 with a clear "Input should be
+    # 'requirements_file'" message instead of producing misleading results.
+    # Real repo URL ingestion is v1.1 roadmap.
+    input_type: Literal["requirements_file"] = Field(
+        ...,
+        description=(
+            "How the user is providing dependency information. Currently "
+            "only 'requirements_file' (base64-encoded requirements.txt "
+            "content) is accepted. Repo URL ingestion is planned for v1.1."
+        ),
+    )
     input_value: str
     use_case: Literal["saas", "internal", "distributed_binary"]
     policy_override: Optional[dict] = None

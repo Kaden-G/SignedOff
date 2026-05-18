@@ -27,7 +27,14 @@ from agent_state import AgentState
 
 
 VALID_USE_CASES: frozenset[str] = frozenset({"saas", "internal", "distributed_binary"})
-VALID_INPUT_TYPES: frozenset[str] = frozenset({"requirements_file", "repo_url"})
+VALID_INPUT_TYPES: frozenset[str] = frozenset({"requirements_file"})
+# "repo_url" used to be valid here but the SBOMNode branch never actually
+# cloned anything — it returned the running venv's packages as the scan
+# result, which is misleading at best. The API layer's Pydantic Literal
+# now rejects repo_url at the boundary; this frozenset is a
+# defense-in-depth check for the rare case where state is constructed
+# directly (e.g. via tests or future internal callers). Re-add when
+# real repo-URL ingestion lands in v1.1.
 
 # Project root is the parent of the nodes/ package — same directory as graph.py.
 # Tests monkeypatch this module attribute to redirect the lookup.

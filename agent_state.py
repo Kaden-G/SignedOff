@@ -718,12 +718,16 @@ class AgentState(TypedDict):
 
     input_type: str
     # How the user provided their dependency information. Values:
-    #   "repo_url"          — GitHub/GitLab repo URL, agent clones and
-    #                         finds requirements.txt / pyproject.toml
-    #   "requirements_file" — direct file upload or path
+    #   "requirements_file" — base64-encoded requirements.txt content
+    # "repo_url" was a v1 input type but its SBOMNode branch never
+    # implemented real cloning — it returned the server's running venv
+    # as the scan result. Removed from API + input_node validation
+    # following the 2026-05-17 smoke test (BUGS.md P0). Real repo URL
+    # ingestion is v1.1 roadmap.
 
     input_value: str
-    # The actual input: URL string or file path depending on input_type.
+    # The actual input: base64-encoded requirements.txt contents
+    # (UTF-8) for input_type="requirements_file".
 
     use_case: str
     # User-declared deployment/distribution model. Critical for license

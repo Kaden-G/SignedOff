@@ -56,12 +56,14 @@ REQUEST:
   Body:
     {
       "input_type": "requirements_file",
-        # Required. "requirements_file" | "repo_url"
+        # Required. Currently the only accepted value: "requirements_file".
+        # "repo_url" was a v1 input type but never implemented real cloning
+        # — it silently returned the server's running venv as the scan
+        # result. Removed at the API layer following the 2026-05-17 smoke
+        # test. Real repo URL ingestion is v1.1 roadmap.
 
-      "input_value": "base64-encoded file contents OR repo URL string",
-        # Required.
-        # For requirements_file: base64-encoded UTF-8 contents of the file
-        # For repo_url: full HTTPS URL e.g. "https://github.com/org/repo"
+      "input_value": "base64-encoded file contents",
+        # Required. base64-encoded UTF-8 contents of a requirements.txt file.
 
       "use_case": "saas",
         # Required. "saas" | "internal" | "distributed_binary"

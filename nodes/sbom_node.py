@@ -268,7 +268,8 @@ def _flatten_tree(tree: list[dict]) -> list[tuple[str, str, bool]]:
     """
     Walk a pipdeptree --json-tree result and yield (name, version, is_top_level)
     triples. is_top_level is the fallback for direct/transitive classification
-    when no requirements file is available (repo_url path).
+    when no explicit set of direct packages was parsed from the input (e.g.
+    a malformed requirements.txt with no recognizable package lines).
     """
     out: list[tuple[str, str, bool]] = []
 
@@ -316,13 +317,13 @@ async def sbom_node(state: AgentState) -> dict:
                 "requirements file declared no recognizable direct packages; "
                 "falling back to pipdeptree top-level entries for direct/transitive"
             )
-    elif input_type == "repo_url":
-        errors.append(
-            "repo_url path is a v1 stub: dependencies are read from the running "
-            "venv; direct/transitive classification falls back to pipdeptree "
-            "tree position"
-        )
     else:
+        # repo_url was a v1 stub that returned the server's running venv as
+        # the scan result — misleading. Removed at the API + input_node
+        # validation layers. v1.1 will reintroduce repo_url with real
+        # cloning; until then, anything other than requirements_file is a
+        # programmer error reaching this branch (state constructed manually
+        # with a stale type, etc.).
         return _failure(f"unsupported input_type: {input_type!r}")
 
     errors.append(
