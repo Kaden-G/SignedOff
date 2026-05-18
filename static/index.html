@@ -957,12 +957,37 @@ function renderFindingDetail(f, row) {
       ` : ""}
 
       <!-- Section C: citations -->
-      <div>
-        <h4 class="text-xs uppercase tracking-wide text-slate-500 mb-2">Evidence (${(f.citations || []).length} citations)</h4>
-        <div class="space-y-2">
-          ${(f.citations || []).map(renderCitationCard).join("") || `<div class="text-sm italic text-slate-400">No citations recorded.</div>`}
-        </div>
-      </div>
+      <!--
+        LLM_INFERENCE citations are filtered OUT of this panel intentionally.
+        The same reasoning is already rendered in the Context Analysis box
+        above (full paragraph + severity arrow + confidence) — showing it
+        again here as a 100-char-truncated card is redundant and looks
+        unpolished. Backend behavior is untouched: the audit trail still
+        records every LLM_INFERENCE citation, the citation-integrity
+        invariant still holds, and weak-citation findings still route to
+        HUMAN_REVIEW. This is a display-only filter.
+      -->
+      ${(() => {
+        const allCitations = f.citations || [];
+        const externalCitations = allCitations.filter(
+          c => String(c.source || "").toLowerCase() !== "llm_inference"
+        );
+        const hasOnlyLLM = allCitations.length > 0 && externalCitations.length === 0;
+        const headerLabel = hasOnlyLLM
+          ? "Evidence (no external citations — see Context Analysis above)"
+          : `Evidence (${externalCitations.length} citation${externalCitations.length === 1 ? "" : "s"})`;
+        const body = externalCitations.length
+          ? externalCitations.map(renderCitationCard).join("")
+          : (hasOnlyLLM
+              ? `<div class="text-sm italic text-slate-400">No external citations on this finding. The Context Analysis section above renders the LLM reasoning that backs it.</div>`
+              : `<div class="text-sm italic text-slate-400">No citations recorded.</div>`);
+        return `
+          <div>
+            <h4 class="text-xs uppercase tracking-wide text-slate-500 mb-2">${headerLabel}</h4>
+            <div class="space-y-2">${body}</div>
+          </div>
+        `;
+      })()}
 
       <!-- Section D: remediation -->
       ${(f.remediations || []).length ? `
