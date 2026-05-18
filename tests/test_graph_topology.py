@@ -464,3 +464,175 @@ def test_resume_after_hitl_uses_ainvoke_with_command_resume():
     )
     # The config must scope the resume to this job's thread_id.
     assert captured["config"]["configurable"]["thread_id"] == "job-x"
+
+
+# ---------------------------------------------------------------------------
+# audit_node fan-in join barrier — regression for the smoke-tested P0 where
+# the audit chain sealed after ONE decision out of 42 because audit_node
+# fired as soon as the fastest of its three predecessors completed (the
+# synchronous auto_remediate_node), without waiting for decision_gate_node
+# to drain pending_human_review across multiple resume cycles.
+# ---------------------------------------------------------------------------
+
+def test_real_graph_source_registers_audit_node_with_defer_true():
+    """
+    Contract lock: graph.py must register audit_node with defer=True
+    so the runtime joins its three parallel predecessors
+    (decision_gate_node, auto_remediate_node, auto_accept_node)
+    before sealing the audit chain.
+
+    Without this flag, the synchronous auto_remediate_node completes
+    first, audit_node sees one ready trigger, and fires — sealing the
+    chain while decision_gate_node is still cycling through pending
+    findings. The user-visible symptom is the HITL chain sealing
+    after the first decision (BUGS.md P0, 2026-05-17 smoke test).
+
+    The compiled PregelNode doesn't expose the defer flag as a public
+    attribute; we check the source like we do for risk_node.
+    """
+    import re
+    graph_py = (PROJECT_ROOT / "graph.py").read_text()
+    pattern = re.compile(
+        r'add_node\(\s*["\']audit_node["\']\s*,\s*audit_node\s*,'
+        r'\s*defer\s*=\s*True',
+        re.MULTILINE,
+    )
+    assert pattern.search(graph_py), (
+        "graph.py must register audit_node with defer=True so the "
+        "audit chain seal waits for all three decision branches "
+        "(decision_gate_node, auto_remediate_node, auto_accept_node) "
+        "before firing. See the comment block in graph.py near the "
+        "audit_node registration for the architectural reasoning."
+    )
+
+
+def test_audit_node_waits_for_partial_decision_resume_cycle():
+    """
+    Behavioral test: a minimal LangGraph that mirrors the production
+    fan-in at audit_node (three predecessors: a synchronous
+    auto_remediate stub, a synchronous auto_accept stub, and a
+    decision_gate stub that calls interrupt() until all findings are
+    decided). With audit_node registered defer=True, the chain MUST
+    NOT seal after only one decision is resumed; it must wait for
+    decision_gate to fully drain pending_human_review.
+
+    This is the regression test for the smoke-tested P0 (job
+    job-6f1b8db0-...). Pre-fix: audit_node would fire alongside the
+    first decision_gate resume and stamp `audit_chain_sealed`. Post-
+    fix: audit_node holds until pending is empty.
+    """
+    from langgraph.types import interrupt as lg_interrupt
+
+    class AS(TypedDict, total=False):
+        pending_human_review: list
+        resolved_findings:    Annotated[list, operator.add]
+        auto_remediated:      Annotated[list, operator.add]
+        auto_accepted:        Annotated[list, operator.add]
+        audit_chain_sealed:   bool
+        status:               str
+
+    async def gate(state):
+        if state.get("pending_human_review"):
+            decisions = lg_interrupt({"pending": state["pending_human_review"]})
+            decisions = list(decisions or [])
+            still_pending = list(state["pending_human_review"])
+            resolved = []
+            for d in decisions:
+                fid = d.get("finding_id")
+                m = next((f for f in still_pending if f["finding_id"] == fid), None)
+                if m:
+                    still_pending = [f for f in still_pending if f["finding_id"] != fid]
+                    resolved.append({**m, "decision_status": d.get("decision_status")})
+            return {"pending_human_review": still_pending, "resolved_findings": resolved}
+        return {}
+
+    async def auto_remediate(state):
+        # Synchronous, completes near-instantly. Pre-fix this would
+        # trigger audit_node alone.
+        return {"auto_remediated": ["a1", "a2"]}
+
+    async def auto_accept(state):
+        return {"auto_accepted": []}
+
+    async def audit(state):
+        return {"audit_chain_sealed": True, "status": "complete"}
+
+    def route_after_risk(_state):
+        return ["gate", "auto_remediate", "auto_accept"]
+
+    def route_to_audit(state):
+        return "gate" if state.get("pending_human_review") else "audit"
+
+    def _build(*, defer_audit: bool):
+        b = StateGraph(AS)
+        # entry shim that fans out to all three branches
+        async def risk(state): return {}
+        b.add_node("risk", risk)
+        b.add_node("gate", gate)
+        b.add_node("auto_remediate", auto_remediate)
+        b.add_node("auto_accept", auto_accept)
+        if defer_audit:
+            b.add_node("audit", audit, defer=True)
+        else:
+            b.add_node("audit", audit)
+        b.set_entry_point("risk")
+        b.add_conditional_edges("risk", route_after_risk)
+        b.add_conditional_edges("gate", route_to_audit)
+        b.add_edge("auto_remediate", "audit")
+        b.add_edge("auto_accept", "audit")
+        b.add_edge("audit", END)
+        return b.compile(checkpointer=MemorySaver())
+
+    async def go():
+        # WITH defer=True (the fixed behavior): partial resume must
+        # NOT seal the chain.
+        g = _build(defer_audit=True)
+        cfg = {"configurable": {"thread_id": "audit-defer"}}
+        initial = {
+            "pending_human_review": [
+                {"finding_id": "f1"}, {"finding_id": "f2"}, {"finding_id": "f3"},
+            ],
+            "resolved_findings": [], "auto_remediated": [], "auto_accepted": [],
+            "audit_chain_sealed": False, "status": "awaiting_human",
+        }
+        await g.ainvoke(initial, config=cfg)
+
+        # Resume with ONE decision out of three pending.
+        from langgraph.types import Command
+        await g.ainvoke(
+            Command(resume=[{"finding_id": "f1", "decision_status": "accepted"}]),
+            config=cfg,
+        )
+
+        snap = await g.aget_state(cfg)
+        v = snap.values
+        # Two findings still pending — audit_node MUST NOT have fired.
+        assert len(v["pending_human_review"]) == 2, (
+            f"pending_human_review wrong after partial resume: {v}"
+        )
+        assert v.get("audit_chain_sealed") is False, (
+            "audit_node fired prematurely on partial decision resume; "
+            "defer=True is not holding the join barrier"
+        )
+        assert v.get("status") != "complete", (
+            f"status flipped to complete with pending findings: {v.get('status')!r}"
+        )
+
+        # Now resume the remaining two — chain should seal.
+        await g.ainvoke(
+            Command(resume=[
+                {"finding_id": "f2", "decision_status": "deferred"},
+                {"finding_id": "f3", "decision_status": "auto_remediate"},
+            ]),
+            config=cfg,
+        )
+        snap = await g.aget_state(cfg)
+        v = snap.values
+        assert v["pending_human_review"] == []
+        assert v.get("audit_chain_sealed") is True, (
+            "audit_node didn't fire even after all pending findings were "
+            f"resolved: {v}"
+        )
+        assert v.get("status") == "complete"
+
+    asyncio.run(go())

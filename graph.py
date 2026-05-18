@@ -260,7 +260,34 @@ def build_graph() -> StateGraph:
     builder.add_node("decision_gate_node",  decision_gate_node)
     builder.add_node("auto_remediate_node", auto_remediate_node)
     builder.add_node("auto_accept_node",    auto_accept_node)
-    builder.add_node("audit_node",          audit_node)
+    # defer=True on audit_node enforces the join across the three
+    # parallel decision branches that converge here:
+    #   - decision_gate_node (conditional edge via route_to_audit;
+    #     loops back to itself while pending_human_review is non-empty)
+    #   - auto_remediate_node (direct edge)
+    #   - auto_accept_node    (direct edge)
+    # Without this, the Pregel runtime fires audit_node as soon as
+    # the fastest branch reaches it. auto_remediate_node is synchronous
+    # and completes near-instantly, while decision_gate_node sits in
+    # interrupt() until the human submits decisions. Without defer,
+    # the first time the user posts a decision and decision_gate_node
+    # processes it (re-running and routing back to itself via
+    # route_to_audit because pending_human_review still has entries),
+    # audit_node observes "all branches that could reach me have done
+    # something" and fires — even though decision_gate_node is still
+    # cycling for the remaining undecided findings.
+    #
+    # The observable symptom pre-fix (smoke test 2026-05-17, job
+    # job-6f1b8db0-7791-4a0f-b529-5d6783c3eafd): submitting one of
+    # 42 pending decisions caused the audit chain to seal, status to
+    # flip to "complete", and 41 findings to stay at human_review
+    # while the graph behaved as if all decisions were in.
+    #
+    # See BUGS.md "P0 — Audit chain seals prematurely" for the full
+    # reproduction. Same architectural pattern as risk_node above —
+    # do not remove this flag without a regression test on partial
+    # HITL resume.
+    builder.add_node("audit_node",          audit_node, defer=True)
     builder.add_node("report_node",         report_node)
 
     # ------------------------------------------------------------------
