@@ -609,3 +609,152 @@ section.
 - The "the description text lies for internal" wording bug (point
   3 above) is a P2 cosmetic regardless of which design wins. Flag
   it for follow-up.
+
+---
+
+## ROOT CAUSE — SBOMNode scans the server's own venv instead of the uploaded requirements.txt (2026-05-18)
+
+**Symptom:** Uploading `demo_requirements.txt` (~150 packages: Django,
+PyYAML, etc.) on the deployed Render instance returns 57 packages that
+match SignedOff's own dependencies (aiohttp, anthropic, langgraph,
+fastapi). The uploaded content is effectively ignored for dependency
+resolution.
+
+### Investigation trace
+
+#### 1. How SBOMNode receives input (`nodes/sbom_node.py:298-300`)
+
+```python
+input_type  = state.get("input_type", "")   # "requirements_file"
+input_value = state.get("input_value", "")   # base64-encoded file CONTENT
+```
+
+State is populated by `api.py:325-328` in `/scan/start`:
+
+```python
+initial_state = {
+    "input_type": body.input_type,   # Literal["requirements_file"]
+    "input_value": body.input_value, # raw base64 string from POST body
+    ...
+}
+```
+
+`input_value` is the file **content** (base64-encoded), NOT a file path.
+
+#### 2. What SBOMNode does with the upload (`nodes/sbom_node.py:309-318`)
+
+For `input_type="requirements_file"`:
+
+```python
+decoded = base64.b64decode(input_value, validate=True).decode("utf-8")
+direct_names = parse_direct_package_names(decoded)
+```
+
+The decoded content is parsed **only** to extract a set of direct package
+names (lowercased). This set is used downstream (line 371-374) solely for
+classifying pipdeptree output as direct vs transitive:
+
+```python
+if has_explicit_direct_set:
+    transitive = name.lower() not in direct_names
+```
+
+**The decoded content is never written to disk. It is never installed.
+It is never passed to any subprocess.**
+
+#### 3. How pipdeptree is invoked (`nodes/sbom_node.py:245-253`)
+
+```python
+def _run_pipdeptree() -> list[dict]:
+    completed = subprocess.run(
+        ["pipdeptree", "--json-tree", "--warn", "silence"],
+        capture_output=True,
+        text=True,
+        timeout=PIPDEPTREE_TIMEOUT_SECONDS,
+        check=True,
+    )
+    return json.loads(completed.stdout)
+```
+
+This is a bare `subprocess.run(["pipdeptree", ...])` with:
+- **No `--python` flag** (would point pipdeptree at a specific interpreter)
+- **No `env=` override** (would isolate the subprocess environment)
+- **No temporary venv creation**
+- **No `--local-only` or path-based flags**
+
+pipdeptree introspects `sys.path` of the calling interpreter by default.
+On the Render deployment, that's the server's own venv containing
+SignedOff's production dependencies — not the user's uploaded packages.
+
+#### 4. The file documents this as intentional (`nodes/sbom_node.py:11-16`)
+
+```
+V1 LIMITATION (intentional, surfaced in errors[]):
+    pipdeptree reports the packages currently installed in the running
+    venv — it does NOT install the submitted requirements file into an
+    isolated env first. For the demo this is fine: the demo venv has
+    `pip install -r demo_requirements.txt` pre-applied. v2 will install
+    into a tempdir venv and run pipdeptree against that.
+```
+
+And line 329-332 appends a warning to every scan:
+
+```python
+errors.append(
+    "v1 limitation: pipdeptree resolves the running venv, not an isolated "
+    "install of the submitted requirements file"
+)
+```
+
+#### 5. Why this worked locally but breaks on Render
+
+The v1 design assumed the demo venv had `pip install -r demo_requirements.txt`
+pre-applied alongside SignedOff's own deps. Locally, the developer's
+`.demo-venv` had both. On the Render deployment, the venv only contains
+SignedOff's production dependencies (from `requirements.txt` at the project
+root), so pipdeptree returns 57 SignedOff packages instead of the ~150
+demo packages.
+
+#### 6. Graph plumbing is correct (`graph.py:296-316`)
+
+State flows cleanly: `input_node` → `sbom_node` via `route_after_input`.
+The full `AgentState` (including `input_type` and `input_value`) is
+available to `sbom_node`. The graph is not the problem.
+
+#### 7. `pip-licenses` has the same issue (`nodes/sbom_node.py:256-264`)
+
+```python
+def _run_pip_licenses() -> list[dict]:
+    completed = subprocess.run(
+        ["pip-licenses", "--format=json", "--with-license-file", "--no-license-path"],
+        ...
+    )
+```
+
+Same bare subprocess pattern — reports licenses for the server's venv,
+not the user's packages. License metadata will also be wrong/incomplete
+for any package not installed in the server venv.
+
+### Verdict
+
+**Reality A: SBOMNode never uses the upload content for dependency
+resolution — subprocess scans whatever venv it runs in.**
+
+The uploaded requirements.txt is decoded and parsed for package names,
+but those names are ONLY used to tag pipdeptree's output as
+direct/transitive. The actual dependency tree and license metadata come
+entirely from the server's running venv via bare `subprocess.run()`
+calls to `pipdeptree` and `pip-licenses`.
+
+**Fix:** Parse the requirements.txt content directly to build the
+package list (names + version pins). For packages with pinned versions,
+query PyPI JSON API (`https://pypi.org/pypi/{name}/{version}/json`) or
+the existing OSV/pip-licenses infrastructure to resolve license and
+transitive dependency metadata — without requiring the packages to be
+installed. pipdeptree and pip-licenses subprocess calls become
+unnecessary for the `requirements_file` input path.
+
+**Estimated effort:** 3–4h (requirements parser already exists as
+`parse_direct_package_names`; needs extension to extract version
+specifiers, plus a PyPI metadata fetcher to replace pipdeptree/
+pip-licenses for uninstalled packages, plus test updates).
