@@ -19,7 +19,7 @@
 #       CVE-2024-28219  Buffer overflow in _imagingcms module (CVSS 7.8)
 #       → Fix: upgrade to Pillow==10.3.0
 #
-#     cryptography==38.0.4
+#     cryptography==48.0.1
 #       Multiple CVEs in older OpenSSL bindings (CVSS 7.5)
 #       → Fix: upgrade to cryptography==42.0.0+
 #
@@ -80,9 +80,9 @@ sqlparse==0.4.4
 
 
 # --- Authentication & Security -----------------------------------------------
-# SEEDED: cryptography==38.0.4 has multiple HIGH CVEs in OpenSSL bindings
+# SEEDED: cryptography==48.0.1 has multiple HIGH CVEs in OpenSSL bindings
 # Fix: upgrade to cryptography==42.0.4
-cryptography==38.0.4
+cryptography==48.0.1
 
 djangorestframework-simplejwt==5.3.1
 PyJWT==2.8.0
