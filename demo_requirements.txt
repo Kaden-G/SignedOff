@@ -169,7 +169,7 @@ tablib==3.5.0
 
 # --- Testing -----------------------------------------------------------------
 # These are clean — all MIT/BSD, no known CVEs at these versions
-pytest==8.1.1
+pytest==9.0.3
 pytest-django==4.8.0
 pytest-asyncio==0.23.6
 factory-boy==3.3.0
