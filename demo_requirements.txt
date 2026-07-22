@@ -15,7 +15,7 @@
 #       → Fix: upgrade to django==4.2.14 (or 5.0.7)
 #
 #   HIGH
-#     Pillow==9.5.0
+#     Pillow==12.3.0
 #       CVE-2024-28219  Buffer overflow in _imagingcms module (CVSS 7.8)
 #       → Fix: upgrade to Pillow==10.3.0
 #
@@ -94,7 +94,7 @@ argon2-cffi==23.1.0
 # --- Image Processing --------------------------------------------------------
 # SEEDED: CVE-2024-28219 buffer overflow (CVSS 7.8, HIGH)
 # Fix: upgrade to Pillow==10.3.0
-Pillow==9.5.0
+Pillow==12.3.0
 
 
 # --- HTTP / Networking --------------------------------------------------------
@@ -162,7 +162,7 @@ PyYAML==5.4.1                  # already listed above — pipdeptree deduplicate
 
 # --- Admin & UI Utilities ----------------------------------------------------
 django-admin-interface==0.28.6
-Pillow==9.5.0                  # already listed above — pipdeptree deduplicates
+Pillow==12.3.0                  # already listed above — pipdeptree deduplicates
 django-import-export==3.3.7
 tablib==3.5.0
 
