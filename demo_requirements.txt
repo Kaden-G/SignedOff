@@ -164,7 +164,7 @@ PyYAML==5.4.1                  # already listed above — pipdeptree deduplicate
 django-admin-interface==0.28.6
 Pillow==9.5.0                  # already listed above — pipdeptree deduplicates
 django-import-export==3.3.7
-tablib==3.5.0
+tablib==3.10.0
 
 
 # --- Testing -----------------------------------------------------------------
