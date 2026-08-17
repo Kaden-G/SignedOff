@@ -76,7 +76,7 @@ mysqlclient==2.1.1
 
 # These are clean (MIT/BSD) — bulk transitive deps
 psycopg2-binary==2.9.9
-sqlparse==0.4.4
+sqlparse==0.6.0
 
 
 # --- Authentication & Security -----------------------------------------------
